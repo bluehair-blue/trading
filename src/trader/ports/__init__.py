@@ -1,0 +1,1 @@
+"""External side-effect contracts."""
