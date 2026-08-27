@@ -2,11 +2,20 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from hashlib import sha256
 
+from trader.domain.broker_lifecycle import (
+    BrokerFillObserved,
+    BrokerLifecycleFact,
+    BrokerOrderCanceled,
+    BrokerOrderExpired,
+    BrokerOrderOpened,
+    BrokerOrderRejected,
+)
+from trader.domain.broker_observations import BrokerOrderRef
 from trader.domain.models import (
     BrokerExecutionState,
     BrokerOrder,
@@ -38,6 +47,7 @@ class SimulationReason(StrEnum):
     DAY_EXPIRED = "DAY_EXPIRED"
     ORDER_TERMINAL = "ORDER_TERMINAL"
     UNSUPPORTED_CORPORATE_ACTION = "UNSUPPORTED_CORPORATE_ACTION"
+    BROKER_REJECTED = "BROKER_REJECTED"
 
 
 def _positive_decimal(value: Decimal, name: str, *, allow_zero: bool = False) -> None:
@@ -85,6 +95,7 @@ class Fill:
     fee: Decimal
     occurred_at: datetime
     quote_sequence: int
+    broker_execution_id: str
 
 
 @dataclass(frozen=True)
@@ -94,6 +105,7 @@ class SimulationResult:
     fills: tuple[Fill, ...] = ()
     affected_quantity: Decimal = Decimal(0)
     detail: str = ""
+    facts: tuple[BrokerLifecycleFact, ...] = ()
 
 
 @dataclass
@@ -103,11 +115,19 @@ class _Order:
     filled: Decimal = Decimal(0)
     canceled: Decimal = Decimal(0)
     expired: Decimal = Decimal(0)
+    rejected: Decimal = Decimal(0)
     last_event: tuple[datetime, int] | None = None
+    opened_fact: BrokerOrderOpened | None = None
 
     @property
     def remaining(self) -> Decimal:
-        return self.request.quantity - self.filled - self.canceled - self.expired
+        return (
+            self.request.quantity
+            - self.filled
+            - self.canceled
+            - self.expired
+            - self.rejected
+        )
 
 
 class SimulatedBroker:
@@ -119,6 +139,7 @@ class SimulatedBroker:
         self,
         *,
         clock: Callable[[], datetime],
+        business_date: Callable[[datetime], date],
         known_symbols: Iterable[str],
         latency: timedelta = timedelta(0),
         partial_fill_cap: int | None = None,
@@ -128,6 +149,8 @@ class SimulatedBroker:
     ) -> None:
         if not callable(clock):
             raise ValueError("clock must be callable")
+        if not callable(business_date):
+            raise ValueError("business_date must be callable")
         if type(latency) is not timedelta or latency < timedelta(0):
             raise ValueError("latency must be a non-negative timedelta")
         if type(max_quote_age) is not timedelta or max_quote_age < timedelta(0):
@@ -142,6 +165,7 @@ class SimulatedBroker:
         if any(type(symbol) is not str or not symbol.strip() for symbol in symbols):
             raise ValueError("known_symbols must contain non-empty strings")
         self._clock = clock
+        self._business_date = business_date
         self._known_symbols = symbols
         self._latency = latency
         self._partial_fill_cap = partial_fill_cap
@@ -153,6 +177,12 @@ class SimulatedBroker:
         self._last_quotes: dict[str, tuple[datetime, int]] = {}
         self._corporate_action_halts: set[str] = set()
         self._last_clock: datetime | None = None
+
+    def _resolve_business_date(self, at: datetime) -> date:
+        business_date = self._business_date(at)
+        if type(business_date) is not date:
+            raise ValueError("business_date resolver must return an exact date")
+        return business_date
 
     def _now(self) -> datetime:
         now = self._clock()
@@ -176,8 +206,34 @@ class SimulatedBroker:
         self._client_ids.add(request.client_order_id)
         digest = sha256(request.client_order_id.encode("utf-8")).hexdigest()[:20]
         broker_order_id = f"sim-{digest}"
-        self._orders[broker_order_id] = _Order(request, broker_order_id)
+        business_date = self._resolve_business_date(now)
+        ref = BrokerOrderRef(
+            self.environment,
+            request.account_id,
+            business_date,
+            broker_order_id,
+        )
+        opened_fact = BrokerOrderOpened(
+            fact_id=f"sim-fact-open-{digest}",
+            client_order_id=request.client_order_id,
+            broker_order_ref=ref,
+            source_api_id="simulated.submit",
+            source_sequence=0,
+            occurred_at=now,
+            observed_at=now,
+            instrument=request.instrument,
+            side=request.side,
+            requested_quantity=request.quantity,
+        )
+        self._orders[broker_order_id] = _Order(
+            request, broker_order_id, opened_fact=opened_fact
+        )
         return BrokerSubmitResult(BrokerSubmitOutcome.ACKNOWLEDGED, broker_order_id)
+
+    def opened_fact(self, broker_order_id: str) -> BrokerOrderOpened:
+        fact = self._orders[broker_order_id].opened_fact
+        assert fact is not None
+        return fact
 
     def on_quote(self, quote: QuoteEvent) -> SimulationResult:
         now = self._now()
@@ -209,16 +265,38 @@ class SimulatedBroker:
         if not candidates:
             return SimulationResult(SimulationReason.NO_ACTIVE_ORDER, detail=quote.symbol)
         fills: list[Fill] = []
+        facts: list[BrokerLifecycleFact] = []
+        expired_order_ids: list[str] = []
+        expired_quantity = Decimal(0)
         last_reason = SimulationReason.NOT_MARKETABLE
         quote_left = Decimal(quote.available_quantity)
+        quote_business_date = self._resolve_business_date(quote.occurred_at)
         for order in candidates:
-            if quote_left == 0:
-                break
             if order.last_event is not None and key <= order.last_event:
                 continue
-            if quote.occurred_at.date() > order.request.created_at.date():
+            assert order.opened_fact is not None
+            if quote_business_date > order.opened_fact.broker_order_ref.business_date:
+                quantity = order.remaining
                 self._expire(order, key)
+                facts.append(
+                    BrokerOrderExpired(
+                        fact_id=self._terminal_fact_id(
+                            "expire", order.broker_order_id, quote.sequence
+                        ),
+                        client_order_id=order.request.client_order_id,
+                        broker_order_ref=order.opened_fact.broker_order_ref,
+                        source_api_id="simulated.quote.expiry",
+                        source_sequence=quote.sequence,
+                        occurred_at=quote.occurred_at,
+                        observed_at=now,
+                        quantity=quantity,
+                    )
+                )
+                expired_order_ids.append(order.broker_order_id)
+                expired_quantity += quantity
                 last_reason = SimulationReason.DAY_EXPIRED
+                continue
+            if quote_left == 0:
                 continue
             if quote.occurred_at < order.request.created_at + self._latency:
                 last_reason = SimulationReason.LATENCY
@@ -236,17 +314,54 @@ class SimulatedBroker:
             raw_price = touch + slip if request.side is Side.BUY else touch - slip
             price = min(raw_price, request.limit_price) if request.side is Side.BUY else max(raw_price, request.limit_price)
             fee = price * quantity * self._fee_bps / Decimal(10_000)
-            fill = Fill(order.broker_order_id, quantity, price, fee, quote.occurred_at, quote.sequence)
+            execution_digest = sha256(
+                f"{order.broker_order_id}:{quote.sequence}".encode("utf-8")
+            ).hexdigest()[:20]
+            execution_id = f"sim-execution-{execution_digest}"
+            fill = Fill(
+                order.broker_order_id,
+                quantity,
+                price,
+                fee,
+                quote.occurred_at,
+                quote.sequence,
+                execution_id,
+            )
             order.filled += quantity
             order.last_event = key
             quote_left -= quantity
             fills.append(fill)
+            assert order.opened_fact is not None
+            facts.append(
+                BrokerFillObserved(
+                    fact_id=f"sim-fact-fill-{execution_digest}",
+                    client_order_id=order.request.client_order_id,
+                    broker_order_ref=order.opened_fact.broker_order_ref,
+                    source_api_id="simulated.quote",
+                    source_sequence=quote.sequence,
+                    occurred_at=quote.occurred_at,
+                    observed_at=now,
+                    broker_execution_id=execution_id,
+                    quantity=quantity,
+                    price=price,
+                    fee=fee,
+                    currency=order.request.instrument.currency,
+                )
+            )
         if fills:
             return SimulationResult(
                 SimulationReason.FILLED,
                 fills[0].broker_order_id if len(fills) == 1 else None,
                 tuple(fills),
                 sum((fill.quantity for fill in fills), Decimal(0)),
+                facts=tuple(facts),
+            )
+        if facts:
+            return SimulationResult(
+                SimulationReason.DAY_EXPIRED,
+                expired_order_ids[0] if len(expired_order_ids) == 1 else None,
+                affected_quantity=expired_quantity,
+                facts=tuple(facts),
             )
         return SimulationResult(last_reason, detail=quote.symbol)
 
@@ -267,10 +382,9 @@ class SimulatedBroker:
         target = command.target
         order = self._orders.get(target.broker_order_id)
         if (
-            target.environment is not self.environment
-            or order is None
-            or target.account_id != order.request.account_id
-            or target.business_date != order.request.created_at.date()
+            order is None
+            or order.opened_fact is None
+            or target != order.opened_fact.broker_order_ref
             or command.instrument != order.request.instrument
         ):
             return BrokerCancelResult(BrokerCancelOutcome.DEFINITE_REJECTED, "TARGET_MISMATCH")
@@ -302,20 +416,62 @@ class SimulatedBroker:
             return SimulationResult(SimulationReason.ORDER_TERMINAL, broker_order_id)
         order.canceled += remaining
         order.last_event = key
-        return SimulationResult(SimulationReason.CANCELED, broker_order_id, affected_quantity=remaining)
+        assert order.opened_fact is not None
+        fact = BrokerOrderCanceled(
+            fact_id=self._terminal_fact_id("cancel", broker_order_id, sequence),
+            client_order_id=order.request.client_order_id,
+            broker_order_ref=order.opened_fact.broker_order_ref,
+            source_api_id="simulated.cancel",
+            source_sequence=sequence,
+            occurred_at=occurred_at,
+            observed_at=now,
+            quantity=remaining,
+        )
+        return SimulationResult(
+            SimulationReason.CANCELED,
+            broker_order_id,
+            affected_quantity=remaining,
+            facts=(fact,),
+        )
 
     def expire_day(self, *, occurred_at: datetime, sequence: int) -> tuple[SimulationResult, ...]:
         require_utc(occurred_at, "occurred_at")
         _sequence(sequence)
-        if occurred_at > self._now():
+        now = self._now()
+        if occurred_at > now:
             raise ValueError("expiry timestamp cannot be in the future")
         key = (occurred_at, sequence)
+        business_date = self._resolve_business_date(occurred_at)
         results = []
         for order in self._orders.values():
-            if order.remaining > 0 and order.request.created_at.date() < occurred_at.date():
+            assert order.opened_fact is not None
+            if (
+                order.remaining > 0
+                and order.opened_fact.broker_order_ref.business_date < business_date
+            ):
                 quantity = order.remaining
                 self._expire(order, key)
-                results.append(SimulationResult(SimulationReason.DAY_EXPIRED, order.broker_order_id, affected_quantity=quantity))
+                assert order.opened_fact is not None
+                fact = BrokerOrderExpired(
+                    fact_id=self._terminal_fact_id(
+                        "expire", order.broker_order_id, sequence
+                    ),
+                    client_order_id=order.request.client_order_id,
+                    broker_order_ref=order.opened_fact.broker_order_ref,
+                    source_api_id="simulated.expiry",
+                    source_sequence=sequence,
+                    occurred_at=occurred_at,
+                    observed_at=now,
+                    quantity=quantity,
+                )
+                results.append(
+                    SimulationResult(
+                        SimulationReason.DAY_EXPIRED,
+                        order.broker_order_id,
+                        affected_quantity=quantity,
+                        facts=(fact,),
+                    )
+                )
         return tuple(results)
 
     def _expire(self, order: _Order, key: tuple[datetime, int]) -> None:
@@ -323,6 +479,63 @@ class SimulatedBroker:
             return
         order.expired += order.remaining
         order.last_event = key
+
+    def reject_order(
+        self,
+        broker_order_id: str,
+        *,
+        occurred_at: datetime,
+        sequence: int,
+        reason_code: str = "BROKER_REJECTED",
+    ) -> SimulationResult:
+        require_utc(occurred_at, "occurred_at")
+        _sequence(sequence)
+        now = self._now()
+        if occurred_at > now:
+            raise ValueError("rejection timestamp cannot be in the future")
+        order = self._orders.get(broker_order_id)
+        if order is None or order.remaining <= 0 or order.filled != 0:
+            return SimulationResult(
+                SimulationReason.ORDER_TERMINAL,
+                broker_order_id,
+                detail="ORDER_NOT_REJECTABLE",
+            )
+        key = (occurred_at, sequence)
+        if order.last_event is not None and key <= order.last_event:
+            return SimulationResult(
+                SimulationReason.ORDER_TERMINAL,
+                broker_order_id,
+                detail="OUT_OF_ORDER_EVENT",
+            )
+        quantity = order.remaining
+        order.rejected = quantity
+        order.last_event = key
+        assert order.opened_fact is not None
+        fact = BrokerOrderRejected(
+            fact_id=self._terminal_fact_id("reject", broker_order_id, sequence),
+            client_order_id=order.request.client_order_id,
+            broker_order_ref=order.opened_fact.broker_order_ref,
+            source_api_id="simulated.reject",
+            source_sequence=sequence,
+            occurred_at=occurred_at,
+            observed_at=now,
+            quantity=quantity,
+            reason_code=reason_code,
+        )
+        return SimulationResult(
+            SimulationReason.BROKER_REJECTED,
+            broker_order_id,
+            affected_quantity=quantity,
+            detail=reason_code,
+            facts=(fact,),
+        )
+
+    @staticmethod
+    def _terminal_fact_id(kind: str, broker_order_id: str, sequence: int) -> str:
+        digest = sha256(
+            f"{kind}:{broker_order_id}:{sequence}".encode("utf-8")
+        ).hexdigest()[:20]
+        return f"sim-fact-{kind}-{digest}"
 
     def on_corporate_action(
         self, symbol: str, action: str, *, occurred_at: datetime, sequence: int
@@ -358,7 +571,11 @@ class SimulatedBroker:
         elif order.expired:
             state = BrokerExecutionState.EXPIRED
         else:
-            state = BrokerExecutionState.FILLED
+            state = (
+                BrokerExecutionState.REJECTED
+                if order.rejected
+                else BrokerExecutionState.FILLED
+            )
         return BrokerOrder(
             broker_order_id,
             order.request.account_id,
@@ -366,7 +583,7 @@ class SimulatedBroker:
             order.filled,
             remaining,
             order.canceled,
-            Decimal(0),
+            order.rejected,
             order.expired,
             state,
         )

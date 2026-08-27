@@ -1,5 +1,6 @@
 """Deterministic simulated adapters."""
 
+from trader.adapters.simulated.clock import VirtualClock
 from trader.adapters.simulated.simulated_broker import (
     Fill,
     QuoteEvent,
@@ -16,4 +17,5 @@ __all__ = [
     "SimulationReason",
     "SimulationResult",
     "StubBroker",
+    "VirtualClock",
 ]

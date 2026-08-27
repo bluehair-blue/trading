@@ -16,7 +16,15 @@ APPLE = InstrumentId("NASDAQ", "AAPL", "USD")
 
 def target(target_id: str, strategy_id: str, quantity: str) -> PositionTarget:
     return PositionTarget(
-        target_id, strategy_id, APPLE, Decimal(quantity), TargetUnit.SHARES, NOW
+        target_id,
+        strategy_id,
+        f"decision-{target_id}",
+        f"{strategy_id}-v1",
+        "strategy-input-1",
+        APPLE,
+        Decimal(quantity),
+        TargetUnit.SHARES,
+        NOW,
     )
 
 
@@ -44,6 +52,10 @@ class PortfolioAllocatorTests(unittest.TestCase):
             [(item.strategy_id, item.quantity) for item in result.virtual_targets],
             [("alpha", Decimal("6")), ("beta", Decimal("4"))],
         )
+        self.assertEqual(
+            [item.source_decision_id for item in result.virtual_targets],
+            ["decision-a", "decision-b"],
+        )
 
     def test_strategy_and_account_caps_fail_closed(self):
         with self.assertRaisesRegex(ValueError, "strategy target exceeds"):
@@ -68,8 +80,7 @@ class PortfolioAllocatorTests(unittest.TestCase):
 
     def test_future_target_and_bool_like_policy_values_are_rejected(self):
         future = PositionTarget(
-            "a",
-            "alpha",
+            "a", "alpha", "decision-a", "alpha-v1", "strategy-input-1",
             APPLE,
             Decimal("1"),
             TargetUnit.SHARES,

@@ -1,10 +1,11 @@
 """Find high-risk credentials in the repository's text source and config files.
 
 This scanner intentionally uses a small set of conservative textual rules. It
-does not guess account numbers or attempt to decode arbitrary data. Every
-Git-tracked or non-ignored workspace file is considered, while known generated,
-cache, and lock artifacts are excluded and binary files are skipped before
-their contents are read.
+does not guess account numbers or attempt to decode arbitrary data. Every Git
+workspace file is considered, including ignored backup and runtime files. The
+exact root `.env` runtime credential store plus known generated, cache, and lock
+artifacts are excluded, and binary files are skipped before their contents are
+read.
 """
 
 from __future__ import annotations
@@ -260,6 +261,8 @@ def _in_scope(relative: Path) -> bool:
     if normalized in _EXCLUDED_FILES:
         return False
     name = relative.name.casefold()
+    if len(relative.parts) == 1 and name == ".env":
+        return False
     if (
         name in _EXCLUDED_FILENAMES
         or name.endswith((".lock", ".generated", ".map"))
@@ -270,9 +273,9 @@ def _in_scope(relative: Path) -> bool:
 
 
 def _workspace_files(root: Path) -> tuple[Path, ...]:
-    """Use Git's workspace view when available, without reading ignored secrets."""
+    """Use Git's workspace view, including ignored backup and runtime files."""
     result = subprocess.run(
-        ["git", "-C", str(root), "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        ["git", "-C", str(root), "ls-files", "--cached", "--others", "-z"],
         capture_output=True,
         check=False,
     )

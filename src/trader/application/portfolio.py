@@ -40,12 +40,21 @@ class InstrumentQuantityLimit:
 class VirtualPositionTarget:
     strategy_id: str
     target_id: str
+    source_decision_id: str
+    strategy_version: str
+    input_snapshot_id: str
     instrument: InstrumentId
     quantity: Decimal
 
     def __post_init__(self) -> None:
-        require_id(self.strategy_id, "strategy_id")
-        require_id(self.target_id, "target_id")
+        for name in (
+            "strategy_id",
+            "target_id",
+            "source_decision_id",
+            "strategy_version",
+            "input_snapshot_id",
+        ):
+            require_id(getattr(self, name), name)
         if type(self.instrument) is not InstrumentId:
             raise ValueError("instrument must be exact InstrumentId")
         require_decimal(self.quantity, "quantity")
@@ -139,6 +148,9 @@ def allocate_targets(
             VirtualPositionTarget(
                 target.strategy_id,
                 target.target_id,
+                target.source_decision_id,
+                target.strategy_version,
+                target.input_snapshot_id,
                 target.instrument,
                 target.quantity,
             )

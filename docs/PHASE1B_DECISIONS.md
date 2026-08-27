@@ -84,11 +84,25 @@ request builder in composition, and no credential-backed paper/live call has bee
 
 - `StubBroker` returns fixed unit-test outcomes. `SimulatedBroker` separately models latency,
   partial fills, quote depth, spread/slippage, fees, cancel/fill ordering, DAY expiry, stale or
-  reordered input, and unresolved corporate-action halts.
+  reordered input, deterministic execution IDs, broker rejection, and unresolved corporate-action
+  halts. A caller-supplied business-date policy prevents UTC dates from silently defining sessions.
 - `PortfolioAllocator` preserves per-strategy virtual target ownership while deriving deterministic
-  account targets under explicit strategy and instrument quantity caps.
-- `RunManifest` serializes the code, strategy, config, data, universe, calendar, corporate-action,
-  fee, slippage, FX, seed, and cutoff-policy versions to canonical JSON with a SHA-256 fingerprint.
+  account targets under explicit strategy and instrument quantity caps. Decision, strategy, and
+  input-snapshot lineage survives target allocation and order audit serialization.
+- Typed broker lifecycle facts fold `OPEN -> PARTIAL/FILLED/CANCELED/EXPIRED/REJECTED` without a
+  generic event bus or projection table. The ledger stores each quantity-resolving fact with its
+  derived incremental risk release in one transaction, rejects caller-supplied releases, and
+  revalidates exact fact, execution-ID, quantity-partition, release-order, and
+  terminal-full-release semantics on reopen.
+- `AccountingSeed` and broker fills form a deterministic, long-only, same-currency Dry cash and
+  position fold. It is not the durable authoritative accounting projection for paper/live.
+- `RunSpec` serializes immutable code, strategy, config, data, universe, calendar,
+  corporate-action, fee, slippage, FX, accounting, seed, cutoff-policy, and sample-window inputs to
+  canonical JSON with a SHA-256 fingerprint. `RunResult` separately binds execution identity,
+  status, timing, ledger digest, output digest, or a canonical failure code to that fingerprint.
+- `VirtualClock` advances only under the Dry runner. The actual runner remains intentionally absent
+  until the strategy, immutable data, calendar, and accounting inputs in
+  [`DRY_BACKTEST_READY.md`](DRY_BACKTEST_READY.md) are selected.
 
 ## Ledger verification and backup
 
@@ -103,8 +117,9 @@ request builder in composition, and no credential-backed paper/live call has bee
 
 1. Select and version the trading calendar/session source, including holidays, early closes, DST,
    missing-data behavior, and update ownership.
-2. Define internal cash/position accounting, fee/tax/FX/settlement/corporate-action correction rules,
-   then add durable projections and replay.
+2. Define authoritative paper/live cash/position accounting, fee/tax/FX/settlement/corporate-action
+   correction rules, then add durable projections and broker reconciliation. The Dry fold is not a
+   substitute for this contract.
 3. Implement authenticated OS-user operator CLI; the current `actor` value is an authenticated
    identity claim, not authentication.
 4. Set maximum order notional, daily loss, exposure, turnover, liquidity, and strategy budget values.

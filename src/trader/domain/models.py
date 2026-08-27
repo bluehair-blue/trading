@@ -29,11 +29,19 @@ def require_enum(value: object, enum_type: type[StrEnum], name: str) -> None:
 
 
 SIGNED_64_MAX = (1 << 63) - 1
+SIGNED_64_MIN = -(1 << 63)
 
 
 def require_minor_integer(value: int, name: str) -> None:
     if type(value) is not int or not 0 <= value <= SIGNED_64_MAX:
         raise ValueError(f"{name} must be a non-negative signed 64-bit integer")
+
+
+def canonical_share_quantity(value: Decimal, name: str = "quantity") -> str:
+    require_decimal(value, name)
+    if value != value.to_integral_value() or not SIGNED_64_MIN <= value <= SIGNED_64_MAX:
+        raise ValueError(f"{name} must be an integral signed 64-bit share quantity")
+    return str(int(value))
 
 
 class RiskStage(StrEnum):
@@ -287,14 +295,23 @@ class StrategyDecision:
 class PositionTarget:
     target_id: str
     strategy_id: str
+    source_decision_id: str
+    strategy_version: str
+    input_snapshot_id: str
     instrument: InstrumentId
     quantity: Decimal
     unit: TargetUnit
     target_at: datetime
 
     def __post_init__(self) -> None:
-        require_id(self.target_id, "target_id")
-        require_id(self.strategy_id, "strategy_id")
+        for name in (
+            "target_id",
+            "strategy_id",
+            "source_decision_id",
+            "strategy_version",
+            "input_snapshot_id",
+        ):
+            require_id(getattr(self, name), name)
         require_decimal(self.quantity, "quantity")
         if self.quantity < 0:
             raise ValueError("long-only PositionTarget cannot be negative")
@@ -309,6 +326,9 @@ class TradeIntent:
     intent_id: str
     target_id: str
     strategy_id: str
+    source_decision_id: str
+    strategy_version: str
+    strategy_input_snapshot_id: str
     account_id: str
     account_snapshot_id: str
     instrument: InstrumentId
@@ -320,7 +340,14 @@ class TradeIntent:
 
     def __post_init__(self) -> None:
         for name in (
-            "intent_id", "target_id", "strategy_id", "account_id", "account_snapshot_id"
+            "intent_id",
+            "target_id",
+            "strategy_id",
+            "source_decision_id",
+            "strategy_version",
+            "strategy_input_snapshot_id",
+            "account_id",
+            "account_snapshot_id",
         ):
             require_id(getattr(self, name), name)
         for name in (

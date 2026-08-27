@@ -140,6 +140,7 @@ class SimulatedCancellationTests(unittest.TestCase):
         wall = MutableClock(NOW)
         broker = SimulatedBroker(
             clock=wall,
+            business_date=lambda value: value.date(),
             known_symbols={"AAPL"},
             partial_fill_cap=2,
         )

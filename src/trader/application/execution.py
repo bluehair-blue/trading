@@ -28,6 +28,7 @@ from trader.domain.models import (
     SubmissionState,
     TradeIntent,
     TradingPermit,
+    canonical_share_quantity,
     require_utc,
 )
 from trader.ports.clock import (
@@ -348,6 +349,20 @@ class OrderCoordinator:
         now: datetime,
         monotonic_now: float,
     ) -> None:
+        try:
+            for name, value in (
+                ("request.quantity", request.quantity),
+                ("risk.original_quantity", risk.original_quantity),
+                ("risk.approved_quantity", risk.approved_quantity),
+                ("plan.quantity", plan.quantity),
+                ("intent.target_quantity", intent.target_quantity),
+                ("intent.current_quantity", intent.current_quantity),
+                ("intent.open_quantity", intent.open_quantity),
+                ("intent.original_quantity", intent.original_quantity),
+            ):
+                canonical_share_quantity(value, name)
+        except ValueError as error:
+            raise SubmissionValidationError("share quantity is outside canonical range") from error
         if risk.risk_stage is not RiskStage.PRE_TRADE:
             raise SubmissionValidationError("submission requires PRE_TRADE risk")
         if risk.outcome not in {RiskOutcome.APPROVED, RiskOutcome.ADJUSTED}:
@@ -457,7 +472,7 @@ class OrderCoordinator:
                 "side": request.side.value,
                 "order_type": request.order_type.value,
                 "time_in_force": request.time_in_force.value,
-                "quantity": str(request.quantity),
+                "quantity": canonical_share_quantity(request.quantity),
                 "limit_price": str(request.limit_price),
                 "created_at": request.created_at.isoformat(),
             },
@@ -470,8 +485,8 @@ class OrderCoordinator:
                     self.safety.evidence.account_snapshot.environment.value
                 ),
                 "trade_intent_id": risk.trade_intent_id,
-                "original_quantity": str(risk.original_quantity),
-                "approved_quantity": str(risk.approved_quantity),
+                "original_quantity": canonical_share_quantity(risk.original_quantity),
+                "approved_quantity": canonical_share_quantity(risk.approved_quantity),
                 "outcome": risk.outcome.value,
                 "reason_codes": list(risk.reason_codes),
                 "evaluated_at": risk.evaluated_at.isoformat(),
@@ -480,6 +495,9 @@ class OrderCoordinator:
                 "intent_id": intent.intent_id,
                 "target_id": intent.target_id,
                 "strategy_id": intent.strategy_id,
+                "source_decision_id": intent.source_decision_id,
+                "strategy_version": intent.strategy_version,
+                "strategy_input_snapshot_id": intent.strategy_input_snapshot_id,
                 "account_id": intent.account_id,
                 "account_snapshot_id": intent.account_snapshot_id,
                 "instrument": {
@@ -487,10 +505,10 @@ class OrderCoordinator:
                     "symbol": intent.instrument.symbol,
                     "currency": intent.instrument.currency,
                 },
-                "target_quantity": str(intent.target_quantity),
-                "current_quantity": str(intent.current_quantity),
-                "open_quantity": str(intent.open_quantity),
-                "original_quantity": str(intent.original_quantity),
+                "target_quantity": canonical_share_quantity(intent.target_quantity),
+                "current_quantity": canonical_share_quantity(intent.current_quantity),
+                "open_quantity": canonical_share_quantity(intent.open_quantity),
+                "original_quantity": canonical_share_quantity(intent.original_quantity),
                 "created_at": intent.created_at.isoformat(),
             },
             "plan": {
@@ -500,7 +518,7 @@ class OrderCoordinator:
                 "side": plan.side.value,
                 "order_type": plan.order_type.value,
                 "time_in_force": plan.time_in_force.value,
-                "quantity": str(plan.quantity),
+                "quantity": canonical_share_quantity(plan.quantity),
                 "limit_price": str(plan.limit_price),
                 "market_evidence": {
                     "snapshot_id": plan.market_evidence.snapshot_id,
@@ -552,11 +570,12 @@ class OrderCoordinator:
         try:
             incomplete = self.ledger.incomplete_submissions(account_id, environment)
             for client_order_id in incomplete:
-                self._record(
-                    client_order_id,
-                    SubmissionState.SUBMITTED_UNKNOWN,
-                    self.clock(),
-                    detail_code="RESTART_RECOVERY",
+                self._complete_submission(
+                    LedgerEvent(
+                        str(uuid4()), SubmissionState.SUBMITTED_UNKNOWN.value,
+                        client_order_id, self.clock(),
+                        {"broker_order_id": None, "detail_code": "RESTART_RECOVERY"},
+                    )
                 )
             for client_order_id in self.ledger.unresolved_unknown_submissions(
                 account_id, environment
@@ -580,26 +599,6 @@ class OrderCoordinator:
         if operator_commands.ledger is not self.ledger or operator_commands.safety is not self.safety:
             raise ValueError("operator and execution services must share ledger and safety")
         operator_commands.resolve_unknown_submission(command, client_order_id, evidence)
-
-    def _record(
-        self,
-        client_order_id: str,
-        state: SubmissionState,
-        occurred_at: datetime,
-        broker_order_id: str | None = None,
-        detail_code: str = "",
-    ) -> None:
-        event = LedgerEvent(
-            str(uuid4()), state.value, client_order_id, occurred_at,
-            {
-                "broker_order_id": broker_order_id,
-                "detail_code": detail_code,
-            },
-        )
-        try:
-            self.ledger.append(event)
-        except Exception as error:
-            self._persistence_failed(client_order_id, error)
 
     def _persistence_failed(self, client_order_id: str, error: Exception) -> None:
         self._do_not_retry.add(client_order_id)

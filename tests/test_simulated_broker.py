@@ -17,7 +17,19 @@ from trader.domain.models import (
     Side,
     TimeInForce,
 )
-from trader.ports.broker import BrokerSubmitOutcome
+from trader.domain.broker_lifecycle import (
+    BrokerFillObserved,
+    BrokerOrderExpired,
+    BrokerOrderOpened,
+    BrokerOrderRejected,
+)
+from trader.domain.broker_observations import BrokerOrderRef
+from trader.domain.cancellation import CancelOrderCommand
+from trader.ports.broker import (
+    BrokerCancelOutcome,
+    BrokerEnvironment,
+    BrokerSubmitOutcome,
+)
 
 
 UTC = timezone.utc
@@ -52,6 +64,7 @@ class SimulatedBrokerTests(unittest.TestCase):
         self.clock = MutableClock(self.start)
         self.broker = SimulatedBroker(
             clock=self.clock,
+            business_date=lambda value: value.date(),
             known_symbols={"AAPL"},
             latency=timedelta(seconds=1),
             partial_fill_cap=3,
@@ -96,6 +109,8 @@ class SimulatedBrokerTests(unittest.TestCase):
         self.assertEqual(fill.quantity, Decimal(3))
         self.assertEqual(fill.price, Decimal("100.1"))
         self.assertEqual(fill.fee, Decimal("0.15015"))
+        self.assertTrue(fill.broker_execution_id.startswith("sim-execution-"))
+        self.assertIs(type(result.facts[0]), BrokerFillObserved)
         observed = self.broker.order(order_id)
         self.assertEqual(observed.execution_state, BrokerExecutionState.PARTIALLY_FILLED)
         self.assertEqual(observed.requested, observed.filled + observed.open)
@@ -103,6 +118,7 @@ class SimulatedBrokerTests(unittest.TestCase):
     def test_limit_price_is_never_violated_by_slippage(self) -> None:
         self.broker = SimulatedBroker(
             clock=self.clock,
+            business_date=lambda value: value.date(),
             known_symbols={"AAPL"},
             slippage_bps=Decimal(1000),
         )
@@ -152,6 +168,98 @@ class SimulatedBrokerTests(unittest.TestCase):
         self.assertEqual(self.broker.order(order_id).execution_state, BrokerExecutionState.EXPIRED)
         self.assertEqual(action.reason, SimulationReason.UNSUPPORTED_CORPORATE_ACTION)
 
+    def test_business_date_policy_controls_cancel_and_day_expiry(self) -> None:
+        shifted_start = datetime(2026, 8, 27, 6, tzinfo=UTC)
+        shifted_clock = MutableClock(shifted_start)
+        shifted = SimulatedBroker(
+            clock=shifted_clock,
+            business_date=lambda value: (value - timedelta(hours=5)).date(),
+            known_symbols={"AAPL"},
+        )
+        cancel_request = request(
+            shifted_start - timedelta(hours=2),
+            client_id="cancel-local-date",
+        )
+        cancel_id = shifted.submit(cancel_request)
+        assert cancel_id.broker_order_id is not None
+        opened = shifted.opened_fact(cancel_id.broker_order_id)
+        self.assertEqual(opened.broker_order_ref.business_date, shifted_start.date())
+        canceled = shifted.cancel(CancelOrderCommand(
+            "cancel-local-date-command",
+            opened.broker_order_ref,
+            cancel_request.instrument,
+            Decimal(10),
+            "snapshot-1",
+        ))
+        self.assertEqual(canceled.outcome, BrokerCancelOutcome.ACK)
+
+        near_midnight = datetime(2026, 8, 27, 23, 30, tzinfo=UTC)
+        shifted_clock.now = near_midnight
+        expiry = shifted.submit(request(near_midnight, client_id="expiry-local-date"))
+        assert expiry.broker_order_id is not None
+        shifted_clock.now += timedelta(hours=1)
+        self.assertEqual(
+            shifted.expire_day(occurred_at=shifted_clock.now, sequence=1),
+            (),
+        )
+        quote_result = shifted.on_quote(QuoteEvent(
+            "AAPL",
+            Decimal(99),
+            Decimal(100),
+            0,
+            shifted_clock.now,
+            2,
+        ))
+        self.assertNotEqual(quote_result.reason, SimulationReason.DAY_EXPIRED)
+        shifted_clock.now += timedelta(days=1)
+        expired = shifted.on_quote(QuoteEvent(
+            "AAPL",
+            Decimal(99),
+            Decimal(100),
+            0,
+            shifted_clock.now,
+            3,
+        ))
+        self.assertEqual(expired.reason, SimulationReason.DAY_EXPIRED)
+        self.assertIs(type(expired.facts[0]), BrokerOrderExpired)
+        self.assertEqual(
+            expired.facts[0].broker_order_ref,
+            BrokerOrderRef(
+                BrokerEnvironment.SIMULATED,
+                "account-1",
+                near_midnight.date(),
+                expiry.broker_order_id,
+            ),
+        )
+
+    def test_open_expire_and_reject_emit_deterministic_lifecycle_facts(self) -> None:
+        order_id = self.submit()
+        first_open = self.broker.opened_fact(order_id)
+        second_open = self.broker.opened_fact(order_id)
+        self.assertIs(type(first_open), BrokerOrderOpened)
+        self.assertEqual(first_open, second_open)
+
+        rejected = self.broker.reject_order(
+            order_id,
+            occurred_at=self.clock.now,
+            sequence=1,
+            reason_code="SIMULATED_REJECT",
+        )
+        self.assertEqual(rejected.reason, SimulationReason.BROKER_REJECTED)
+        self.assertIs(type(rejected.facts[0]), BrokerOrderRejected)
+        self.assertEqual(
+            self.broker.order(order_id).execution_state,
+            BrokerExecutionState.REJECTED,
+        )
+
+        expiring_id = self.broker.submit(
+            request(self.clock.now, client_id="expires")
+        ).broker_order_id
+        assert expiring_id is not None
+        self.clock.now += timedelta(days=1)
+        expired = self.broker.expire_day(occurred_at=self.clock.now, sequence=2)
+        self.assertIs(type(expired[0].facts[0]), BrokerOrderExpired)
+
     def test_corporate_action_halts_active_and_future_orders_until_policy_exists(self) -> None:
         order_id = self.submit()
         action = self.broker.on_corporate_action(
@@ -175,6 +283,7 @@ class SimulatedBrokerTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 SimulatedBroker(
                     clock=self.clock,
+                    business_date=lambda value: value.date(),
                     known_symbols={"AAPL"},
                     fee_bps=value,  # type: ignore[arg-type]
                 )

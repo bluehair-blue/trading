@@ -47,7 +47,7 @@ ACCOUNT_NUMBER = "123456789012"
 """
         self.assertEqual((), scan_text(source, Path("example.py")))
 
-    def test_git_scan_covers_tracked_ignored_paths_without_reading_local_secrets(self) -> None:
+    def test_git_scan_covers_ignored_paths_without_rendering_secret_values(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             (root / "src").mkdir()
@@ -67,6 +67,9 @@ ACCOUNT_NUMBER = "123456789012"
             )
             (root / "backups" / "leak.txt").write_text(
                 "PASSWORD=backup-live-value-7f3a9c\n", encoding="utf-8"
+            )
+            (root / "backups" / ".env.local").write_text(
+                'APP_SECRET="backup-env-live-value-7f3a9c"\n', encoding="utf-8"
             )
             (root / "runtime" / "leak.cfg").write_text(
                 "SECRET=runtime-live-value-7f3a9c\n", encoding="utf-8"
@@ -88,10 +91,10 @@ ACCOUNT_NUMBER = "123456789012"
             )
             (root / "uv.lock").write_text('APP_SECRET = "lock-value"\n', encoding="utf-8")
             (root / ".gitignore").write_text(
-                "local.secret\nbackups/\nruntime/\ncache/\ngenerated/\n",
+                ".env*\nbackups/\nruntime/\ncache/\ngenerated/\n",
                 encoding="utf-8",
             )
-            (root / "local.secret").write_text(
+            (root / ".env.local").write_text(
                 'APP_SECRET="local-ignored-value-7f3a9c"\n', encoding="utf-8"
             )
             subprocess.run(["git", "init", "-q"], cwd=root, check=True)
@@ -99,16 +102,11 @@ ACCOUNT_NUMBER = "123456789012"
                 [
                     "git",
                     "add",
-                    "-f",
                     ".gitignore",
                     "src/unsafe.py",
                     "tests/leak.py",
                     "fixtures/leak.env",
                     "fixtures/placeholders.env",
-                    "backups/leak.txt",
-                    "runtime/leak.cfg",
-                    "cache/cache.env",
-                    "generated/generated.env",
                     "binary.dat",
                     "scripts/secret_scan.py",
                     "uv.lock",
@@ -120,7 +118,15 @@ ACCOUNT_NUMBER = "123456789012"
             findings = scan_repository(root)
             finding_paths = {finding.path.relative_to(root).as_posix() for finding in findings}
             self.assertEqual(
-                {"src/unsafe.py", "tests/leak.py", "fixtures/leak.env", "backups/leak.txt", "runtime/leak.cfg"},
+                {
+                    ".env.local",
+                    "src/unsafe.py",
+                    "tests/leak.py",
+                    "fixtures/leak.env",
+                    "backups/.env.local",
+                    "backups/leak.txt",
+                    "runtime/leak.cfg",
+                },
                 finding_paths,
             )
             rendered = "\n".join(str(finding) for finding in findings)
@@ -128,6 +134,7 @@ ACCOUNT_NUMBER = "123456789012"
                 "pR7!mQ2#vL8@xN4$zK6",
                 "tok_live_7f3a9c2d1e8b4a6c",
                 "backup-live-value-7f3a9c",
+                "backup-env-live-value-7f3a9c",
                 "runtime-live-value-7f3a9c",
                 "local-ignored-value-7f3a9c",
             ):

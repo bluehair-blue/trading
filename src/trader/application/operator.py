@@ -26,6 +26,7 @@ from trader.ports.ledger import (
     LedgerEvent,
     LedgerPersistenceError,
     OperatorCommandConflict,
+    canonical_operator_command,
 )
 
 T = TypeVar("T")
@@ -73,6 +74,7 @@ class OperatorCommandService:
         effect: Callable[[datetime], T],
         *,
         related_order_id: str | None = None,
+        cancellation: CancelOrderCommand | None = None,
     ) -> T:
         if type(command) is not OperatorCommand:
             raise TypeError("operator action requires an OperatorCommand")
@@ -84,24 +86,12 @@ class OperatorCommandService:
             command.command_id,
             command.requested_at,
             {
-                "command_id": command.command_id,
-                "actor": command.actor,
-                "reason": command.reason,
-                "deployment_version": command.deployment_version,
-                "expected_safety_epoch": command.expected_safety_epoch,
-                "requested_at": command.requested_at.isoformat(),
-                "expires_at": command.expires_at.isoformat(),
-                "action": command.action.value,
-                "account_id": command.account_id,
-                "environment": command.environment.value,
-                "client_order_id": command.client_order_id,
-                "risk_decision_id": command.risk_decision_id,
-                "execution_plan_id": command.execution_plan_id,
+                **canonical_operator_command(command, cancellation),
                 "previous_state": self.safety.state.value,
             },
         )
         try:
-            self.ledger.reserve_operator_command(command, requested)
+            self.ledger.reserve_operator_command(command, requested, cancellation)
         except OperatorCommandConflict:
             raise
         except Exception as error:
@@ -117,7 +107,11 @@ class OperatorCommandService:
                 OperatorCommandOutcome.FAILED,
                 error,
                 occurred_at=command.requested_at,
-                related_order_id=related_order_id,
+                related_order_id=(
+                    related_order_id
+                    if expected_action is OperatorAction.RESOLVE_SUBMITTED_UNKNOWN
+                    else None
+                ),
             )
             raise OperatorCommandRejected("operator clock failed before effect") from error
         try:
@@ -128,7 +122,11 @@ class OperatorCommandService:
                 command,
                 OperatorCommandOutcome.FAILED,
                 error,
-                related_order_id=related_order_id,
+                related_order_id=(
+                    related_order_id
+                    if expected_action is OperatorAction.RESOLVE_SUBMITTED_UNKNOWN
+                    else None
+                ),
             )
             raise
         self._terminal(
@@ -243,7 +241,6 @@ class OperatorCommandService:
 
     def issue_permit(self, command: OperatorCommand) -> TradingPermit:
         scopes = {
-            OperatorAction.ISSUE_CANCEL: PermitScope.CANCEL,
             OperatorAction.ISSUE_REDUCE_ONLY: PermitScope.REDUCE_ONLY,
             OperatorAction.ISSUE_EMERGENCY_FLATTEN: PermitScope.EMERGENCY_FLATTEN,
         }
@@ -275,6 +272,7 @@ class OperatorCommandService:
             OperatorAction.ISSUE_CANCEL,
             lambda now: self.safety._issue_cancel_permit(cancellation, now),
             related_order_id=cancellation.target.broker_order_id,
+            cancellation=cancellation,
         )
 
     def resolve_unknown_submission(

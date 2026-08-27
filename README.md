@@ -8,7 +8,8 @@
 시뮬레이터 기반**까지다. 계좌별 프로세스 잠금, 저장소가 강제하는 제출 상태기계, 모든
 환경의 단일 주문 경로와 permit 소비, risk reservation, 구조화 계좌 관측·대사, 단일
 WebSocket supervisor, 계층형 rate limit, no-retry mutation 분류기, typed UNKNOWN 증거,
-allocator와 재현 manifest를 구현했다. 적용 약관과 운영 통제는
+allocator, 브로커 주문·체결 사실 재생, Dry 회계 fold와 재현 가능한 `RunSpec`/`RunResult`를
+구현했다. 적용 약관과 운영 통제는
 [키움 Open API 약관 검토](docs/TERMS_REVIEW.md)에 기록한다.
 
 중요한 경계가 있다. 현재 키움 코드는 주입된 transport와 합성 응답으로 검증한 독립
@@ -186,7 +187,8 @@ entrypoints -> application -> domain
 | `TradingPermit` | 모든 환경에서 필요한 계좌·환경·행위 범위·안전 epoch·스냅숏·정책·만료가 묶인 능력 객체 |
 | `OperatorCommand` | 명령 ID, 행위자, 사유, 이전·결과 상태, 배포 버전과 요청·완료 시각 |
 | `LedgerEntry` | 순번, 이벤트 종류, 내부/브로커 ID, 발생·기록 시각, 원본 참조 |
-| `RunManifest` | 코드·전략·설정·데이터·비용 모델 버전과 실행 기간 |
+| `RunSpec` | 실행 전에 고정하는 코드·전략·설정·데이터·캘린더·비용·회계 정책 버전과 표본 기간 |
+| `RunResult` | 실행 ID·상태·시각과 입력 fingerprint·원장·출력 digest를 결합한 실행 결과 |
 
 ### 위험 단계
 
@@ -401,15 +403,20 @@ WebSocket disconnect, timeout·401·malformed response와 crash/restart 대사�
 4. DB 트랜잭션 밖에서 키움 주문 전송
 5. 새 트랜잭션으로 ACKNOWLEDGED, 확정적 SUBMISSION_REJECTED 또는 SUBMITTED_UNKNOWN 기록
 6. WebSocket 주문·체결 이벤트와 REST 조회로 BrokerExecution 확정
-7. Broker observation과 reconciliation 결과를 기록한다. 영구 cash·position 회계
-   projection은 회계 정책을 확정한 뒤 추가한다.
+7. 정규화한 typed broker fact를 기록한다. 수량을 해소하는 fact는 해당 risk reservation
+   해제를 같은 트랜잭션에 기록하고, 재시작 때 주문 수량 partition과 해제 금액을 전부
+   replay해 검증한다.
+8. Dry 모드는 불변 `AccountingSeed`와 체결 사실로 cash·position을 순수 재생한다. 실제
+   계좌의 영구 cash·position projection은 회계 정책과 broker 대사 계약을 확정한 뒤 추가한다.
 ```
 
 - 원장은 append-only 감사 기록이며 원장 저장 API에는 `UPDATE/DELETE`가 없다. DB가 권한을 지원하면 애플리케이션 계정에서도 이를 제거하고, SQLite에서는 보호 trigger와 회귀 테스트로 강제한다. 오류 수정은 원본을 참조하는 정정 이벤트만 추가한다.
 - 각 원장 이벤트와 그로부터 파생되는 projection 갱신은 하나의 DB 트랜잭션으로 commit한다. 외부 API 호출을 DB 트랜잭션 안에서 기다리지 않는다.
 - `client_order_id`, scoped `broker_order_id`, scoped `broker_execution_id`, `event_id`, `operator_command_id`의 고유성은 DB 제약으로도 강제한다.
-- reservation은 ACK·UNKNOWN에서는 유지하고 확정 거절 또는 완전한 조회로 증명한
-  `CONFIRMED_ABSENT`에서만 원자적으로 해제한다.
+- reservation은 ACK·UNKNOWN만으로 해제하지 않는다. 확정 거절·완전한 조회로 증명한
+  `CONFIRMED_ABSENT`는 전액을, 체결·취소·만료·브로커 거절 fact는 해소 수량에 해당하는
+  금액·노출·매도 수량을 원자적으로 해제한다. terminal fact에서는 반올림 잔여까지 전부
+  해제한다.
 - 수량 partition 불변식과 허용된 내부·브로커 상태 전이는 저장 전에 검사하고 replay/restore 후 다시 검증한다.
 - 재시작 시 미완료 제출을 스캔한다. 마지막 이벤트가 `SUBMISSION_STARTED`면 실제 전송 여부와 관계없이 `SUBMITTED_UNKNOWN` 이벤트를 추가하고 자동 재전송하지 않는다.
 - 브로커 주문 ID나 체결을 확정적으로 연결할 수 없는 불확정 주문은 운영자가 해소할 때까지 `HALTED`를 유지한다.
@@ -501,17 +508,20 @@ uv run python scripts/verify.py
 compileall, 전체 unittest, coverage floor 70%, Ruff, repository secret scan,
 `uv pip check --python <현재 인터프리터>`를 fail-fast로 실행한다. GitHub Actions는
 Ubuntu와 Windows에서 locked development environment를 다시 만들고 같은 명령을 실행한다.
-2026-08-27 현재 전체 248개 테스트와 branch coverage 84%가 통과했다.
+2026-08-27 현재 전체 273개 테스트와 branch coverage 85%가 통과했다.
 전체 `src` mypy에는 현재 실제 오류가 남아 있어 broad ignore나 exclude로 녹색을 가장하지
 않고 type-check gate를 보류했다.
 
 이번 체크포인트는 공통 모드 safety/permit, 저장소가 강제하는 제출 상태, risk reservation,
 구조화 read-only 관측과 대사, 단일 WebSocket supervisor, 계층형 limiter, no-retry mutation
-분류, typed `SUBMITTED_UNKNOWN` 증거, WAL-safe local backup/restore, simulator, allocator와
-research manifest를 구현했다. 세부 결정과 다음 blocking gate는
+분류, typed `SUBMITTED_UNKNOWN` 증거, WAL-safe local backup/restore, simulator, allocator,
+typed broker lifecycle, Dry 회계 fold와 `RunSpec`/`RunResult`를 구현했다. 실제 Dry 실행 전에
+고정할 입력은 [`docs/DRY_BACKTEST_READY.md`](docs/DRY_BACKTEST_READY.md)에 기록한다. 세부
+결정과 다음 blocking gate는
 [`docs/PHASE1B_DECISIONS.md`](docs/PHASE1B_DECISIONS.md)에 기록한다.
 
-TradingCalendar source, 영구 cash·position accounting projection, 인증된 운영자 CLI,
+전략·불변 시장 데이터·TradingCalendar source·회계 시작 상태와 정책, 실제 backtest
+entrypoint, 영구 cash·position accounting projection, 인증된 운영자 CLI,
 보존·암호화·off-host backup, 실제 broker 연결과 주문·정정·취소·축소·청산은 명시적으로
 보류한다. 합성 응답으로 만든 UNKNOWN 증거와 CI 결과를 broker 독립 검증으로 간주하지 않는다.
 
@@ -521,14 +531,15 @@ TradingCalendar source, 영구 cash·position accounting projection, 인증된 �
 |---|---|---|
 | 0. 명세 | 이 아키텍처, 전략·주문 의미, 위험·운영 정책 | 아래 Phase 1 blocking 결정이 모두 닫히고 가정과 사실이 구분됨 |
 | 1. 코어 | 도메인 계약, StubBroker, 원장, 세 위험 단계, calendar/permit/operator control | 상태·불변식·안전 단위 테스트 통과 |
-| 2. 백테스트 | 비용·슬리피지, 편향 방지, RunManifest | 홀드아웃·워크포워드 재현 가능 |
+| 2. 백테스트 | 비용·슬리피지, 편향 방지, `RunSpec`/`RunResult` | 홀드아웃·워크포워드 재현 가능 |
 | 3. 읽기 전용 | 키움 인증, 시세, 계좌, WebSocket | 장시간 실행·재연결·대사 통과 |
 | 4. 모의 주문 | 주문·정정·취소·부분체결 | 중복·타임아웃·재시작 테스트 통과 |
 | 5. 섀도 | 실제 시세 + 가상 체결 | 예상/실제 가능 체결 괴리 측정 |
 | 6. 제한 실전 | 최소 금액과 강한 한도 | 운영 기간 동안 안전 위반 없음 |
 
-다음 단계는 실제 endpoint를 추가하는 일이 아니라 아래 운영·회계 결정을 닫고 paper
-read-only 장시간 검증을 수행하는 것이다.
+다음 단계는 실제 endpoint를 추가하는 일이 아니다. 먼저 Dry 입력인 전략·불변 데이터·
+캘린더·회계 정책을 확정해 재현 실행을 통과시키고, 그 뒤 아래 paper 운영 결정을 닫아
+read-only 장시간 검증을 수행한다.
 
 1. 미국 현물주식 대상 확정
 2. 전략·보유 기간·유니버스와 `PositionTarget` 단위·리밸런싱 주기·전략별 실제 budget

@@ -18,12 +18,15 @@ from trader.domain.broker_observations import (
     resolution_from_payload,
 )
 from trader.domain.models import (
+    BrokerExecutionState,
     OperatorAction,
     OperatorCommand,
     OperatorCommandOutcome,
     SafetyState,
     ReservationTerms,
+    Side,
     TradingEnvironment,
+    canonical_share_quantity,
     require_id,
     require_utc,
 )
@@ -34,6 +37,18 @@ from trader.ports.ledger import (
     OrderReservationConflict,
     PermitAlreadyConsumed,
     ReservationCapacityExceeded,
+    canonical_operator_command,
+)
+from trader.domain.cancellation import CancelOrderCommand
+from trader.domain.broker_lifecycle import (
+    BROKER_LIFECYCLE_FACT_TYPES,
+    BrokerFillObserved,
+    BrokerLifecycleFact,
+    BrokerLifecycleProjection,
+    BrokerOrderOpened,
+    broker_fact_from_payload,
+    canonical_broker_fact_payload,
+    fold_broker_order,
 )
 
 SCHEMA_VERSION = 10
@@ -41,6 +56,14 @@ TERMINAL_EVENTS = {
     OperatorCommandOutcome.SUCCEEDED: "OPERATOR_COMMAND_SUCCEEDED",
     OperatorCommandOutcome.FAILED: "OPERATOR_COMMAND_FAILED",
 }
+BROKER_FACT_EVENTS = {
+    "ORDER_OPENED": "BROKER_ORDER_OPENED",
+    "FILL_OBSERVED": "BROKER_FILL_OBSERVED",
+    "ORDER_CANCELED": "BROKER_ORDER_CANCELED",
+    "ORDER_EXPIRED": "BROKER_ORDER_EXPIRED",
+    "ORDER_REJECTED": "BROKER_ORDER_REJECTED",
+}
+BROKER_EVENT_TYPES = frozenset(BROKER_FACT_EVENTS.values())
 
 
 class SchemaError(RuntimeError):
@@ -631,18 +654,32 @@ V9_STATEMENTS = (
                 FROM ledger_events e WHERE e.aggregate_id=NEW.aggregate_id
                 AND e.event_type='RISK_RELEASED'),0) >
                 (SELECT reserved_sell_quantity FROM risk_reservations WHERE client_order_id=NEW.aggregate_id)
-            OR NOT EXISTS (SELECT 1 FROM risk_reservations r
-              WHERE r.client_order_id=NEW.aggregate_id
-                AND r.reserved_cash_minor=json_extract(NEW.payload_json,'$.reserved_cash_minor')
-                AND r.reserved_exposure_minor=json_extract(NEW.payload_json,'$.reserved_exposure_minor')
-                AND r.reserved_sell_quantity=json_extract(NEW.payload_json,'$.reserved_sell_quantity'))
-            OR NOT EXISTS (SELECT 1 FROM ledger_events terminal
-              WHERE terminal.aggregate_id=NEW.aggregate_id AND terminal.sequence=(
-                SELECT MAX(prior.sequence) FROM ledger_events prior
-                WHERE prior.aggregate_id=NEW.aggregate_id)
-              AND (terminal.event_type='SUBMISSION_REJECTED'
-                OR (terminal.event_type='SUBMITTED_UNKNOWN_RESOLVED'
-                  AND json_extract(terminal.payload_json,'$.result')='CONFIRMED_ABSENT'))))
+            OR NOT (
+              EXISTS (SELECT 1 FROM ledger_events cause
+                WHERE cause.aggregate_id=NEW.aggregate_id AND cause.sequence=(
+                  SELECT MAX(prior.sequence) FROM ledger_events prior
+                  WHERE prior.aggregate_id=NEW.aggregate_id)
+                AND cause.event_type IN
+                  ('BROKER_FILL_OBSERVED','BROKER_ORDER_CANCELED',
+                   'BROKER_ORDER_EXPIRED','BROKER_ORDER_REJECTED')
+                AND NEW.event_id='risk-released:' || cause.event_id)
+              OR (
+                EXISTS (SELECT 1 FROM risk_reservations r
+                  WHERE r.client_order_id=NEW.aggregate_id
+                    AND r.reserved_cash_minor=
+                      json_extract(NEW.payload_json,'$.reserved_cash_minor')
+                    AND r.reserved_exposure_minor=
+                      json_extract(NEW.payload_json,'$.reserved_exposure_minor')
+                    AND r.reserved_sell_quantity=
+                      json_extract(NEW.payload_json,'$.reserved_sell_quantity'))
+                AND EXISTS (SELECT 1 FROM ledger_events terminal
+                  WHERE terminal.aggregate_id=NEW.aggregate_id AND terminal.sequence=(
+                    SELECT MAX(prior.sequence) FROM ledger_events prior
+                    WHERE prior.aggregate_id=NEW.aggregate_id)
+                  AND (terminal.event_type='SUBMISSION_REJECTED'
+                    OR (terminal.event_type='SUBMITTED_UNKNOWN_RESOLVED'
+                      AND json_extract(terminal.payload_json,'$.result')=
+                        'CONFIRMED_ABSENT'))))))
           THEN RAISE(ABORT, 'risk release exceeds reservation') END;
         END""",
 )
@@ -1023,6 +1060,54 @@ class SQLiteLedger:
         return json.loads(value, object_pairs_hook=reject_duplicates)
 
     @staticmethod
+    def _cancel_binding_is_valid(canonical: dict[str, object]) -> bool:
+        payload = canonical.get("cancel_order")
+        digest = canonical.get("cancel_order_sha256")
+        if canonical.get("action") != OperatorAction.ISSUE_CANCEL.value:
+            return payload is None and digest is None
+        if not isinstance(payload, dict) or not isinstance(digest, str):
+            return False
+        target = payload.get("target")
+        instrument = payload.get("instrument")
+        try:
+            quantity = payload["remaining_quantity"]
+            valid = (
+                set(payload) == {
+                    "command_id", "target", "instrument", "remaining_quantity",
+                    "account_snapshot_id",
+                }
+                and isinstance(target, dict)
+                and set(target) == {
+                    "environment", "account_id", "business_date", "broker_order_id",
+                }
+                and target["environment"] == canonical["environment"]
+                and target["account_id"] == canonical["account_id"]
+                and isinstance(target["business_date"], str)
+                and datetime.fromisoformat(target["business_date"]).date().isoformat()
+                == target["business_date"]
+                and isinstance(instrument, dict)
+                and set(instrument) == {"market", "symbol", "currency"}
+                and isinstance(quantity, str)
+                and canonical_share_quantity(
+                    Decimal(quantity), "remaining_quantity"
+                ) == quantity
+                and Decimal(quantity) > 0
+            )
+            for value in (
+                target["broker_order_id"], payload["account_snapshot_id"],
+                instrument["market"], instrument["symbol"], instrument["currency"],
+            ):
+                require_id(value, "cancel binding")
+        except (KeyError, TypeError, ValueError, InvalidOperation):
+            return False
+        expected = hashlib.sha256(
+            json.dumps(
+                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
+        return valid and digest == expected
+
+    @staticmethod
     def _validate_submission_states(connection: sqlite3.Connection) -> None:
         order_ids = {
             row[0] for row in connection.execute(
@@ -1134,11 +1219,18 @@ class SQLiteLedger:
                     "client_order_id", "risk_decision_id", "execution_plan_id",
                 }
                 environment_command_keys = current_command_keys | {"environment"}
-                legacy_command = frozenset(canonical) == frozenset(legacy_command_keys)
+                cancel_keys = {"cancel_order", "cancel_order_sha256"}
+                bound_legacy_keys = legacy_command_keys | cancel_keys
+                bound_current_keys = current_command_keys | cancel_keys
+                bound_command_keys = environment_command_keys | cancel_keys
+                legacy_command = frozenset(canonical) in {
+                    frozenset(legacy_command_keys), frozenset(bound_legacy_keys),
+                }
                 if (
                     frozenset(canonical) not in {
                         frozenset(legacy_command_keys), frozenset(current_command_keys),
-                        frozenset(environment_command_keys),
+                        frozenset(environment_command_keys), frozenset(bound_legacy_keys),
+                        frozenset(bound_current_keys), frozenset(bound_command_keys),
                     }
                     or canonical["command_id"] != command_id
                     or (
@@ -1169,6 +1261,11 @@ class SQLiteLedger:
                     risk_decision_id=canonical.get("risk_decision_id"),
                     execution_plan_id=canonical.get("execution_plan_id"),
                 )
+                if (
+                    cancel_keys.issubset(canonical)
+                    and not SQLiteLedger._cancel_binding_is_valid(canonical)
+                ):
+                    raise SchemaError("operator cancellation binding is malformed")
                 commands[command_id] = (parsed, canonical)
 
             rows = connection.execute(
@@ -1308,8 +1405,7 @@ class SQLiteLedger:
                                 ):
                                     payload_invalid = True
                             action = commands[aggregate_id][0].action
-                            permit_action = action in {
-                                OperatorAction.ISSUE_CANCEL,
+                            other_permit_action = action in {
                                 OperatorAction.ISSUE_REDUCE_ONLY,
                                 OperatorAction.ISSUE_EMERGENCY_FLATTEN,
                             }
@@ -1317,11 +1413,32 @@ class SQLiteLedger:
                                 action is OperatorAction.RESOLVE_SUBMITTED_UNKNOWN
                                 and (order_id is None or permit_id is not None)
                             ) or (
-                                permit_action
+                                action is OperatorAction.ISSUE_CANCEL
+                                and outcome is OperatorCommandOutcome.SUCCEEDED
+                                and (
+                                    permit_id is None
+                                    or order_id is None
+                                    or not SQLiteLedger._cancel_binding_is_valid(
+                                        commands[aggregate_id][1]
+                                    )
+                                    or order_id
+                                    != commands[aggregate_id][1]["cancel_order"]["target"][
+                                        "broker_order_id"
+                                    ]
+                                )
+                            ) or (
+                                other_permit_action
                                 and outcome is OperatorCommandOutcome.SUCCEEDED
                                 and (permit_id is None or order_id is not None)
                             ) or (
-                                (not permit_action or outcome is OperatorCommandOutcome.FAILED)
+                                (
+                                    action not in {
+                                        OperatorAction.ISSUE_CANCEL,
+                                        OperatorAction.ISSUE_REDUCE_ONLY,
+                                        OperatorAction.ISSUE_EMERGENCY_FLATTEN,
+                                    }
+                                    or outcome is OperatorCommandOutcome.FAILED
+                                )
                                 and action is not OperatorAction.RESOLVE_SUBMITTED_UNKNOWN
                                 and (permit_id is not None or order_id is not None)
                             )
@@ -1441,6 +1558,134 @@ class SQLiteLedger:
                 ).fetchone()
                 if malformed is not None or orphan is not None:
                     raise SchemaError("risk reservation projection is malformed")
+                lifecycle: dict[
+                    str, list[tuple[int, str, BrokerLifecycleFact]]
+                ] = {}
+                broker_refs: dict[object, str] = {}
+                execution_ids: set[str] = set()
+                for (
+                    sequence, event_id, event_type, aggregate_id, occurred_at,
+                    payload_json,
+                ) in rows:
+                    if event_type not in BROKER_EVENT_TYPES:
+                        continue
+                    payload = SQLiteLedger._strict_json(payload_json)
+                    fact = broker_fact_from_payload(payload)
+                    if (
+                        BROKER_FACT_EVENTS[payload["kind"]] != event_type
+                        or fact.fact_id != event_id
+                        or fact.client_order_id != aggregate_id
+                        or fact.occurred_at != datetime.fromisoformat(occurred_at)
+                    ):
+                        raise SchemaError("broker lifecycle event is not canonical")
+                    owner = broker_refs.setdefault(fact.broker_order_ref, aggregate_id)
+                    if owner != aggregate_id:
+                        raise SchemaError("broker order reference is bound to multiple clients")
+                    if type(fact) is BrokerFillObserved:
+                        if fact.broker_execution_id in execution_ids:
+                            raise SchemaError("broker execution ID is duplicated")
+                        execution_ids.add(fact.broker_execution_id)
+                    lifecycle.setdefault(aggregate_id, []).append(
+                        (sequence, event_type, fact)
+                    )
+                reservation_ids = {
+                    row[0] for row in connection.execute(
+                        "SELECT client_order_id FROM risk_reservations"
+                    )
+                }
+                if not set(lifecycle).issubset(reservation_ids):
+                    raise SchemaError("broker lifecycle has no risk reservation")
+                for order_id, cash, exposure, sell, side in connection.execute(
+                    """SELECT client_order_id,reserved_cash_minor,
+                              reserved_exposure_minor,reserved_sell_quantity,side
+                       FROM risk_reservations"""
+                ):
+                    requires_full_release = connection.execute(
+                        """SELECT EXISTS(SELECT 1 FROM ledger_events
+                               WHERE aggregate_id=? AND event_type='SUBMISSION_REJECTED')
+                                  OR EXISTS(SELECT 1 FROM ledger_events
+                               WHERE aggregate_id=?
+                                 AND event_type='SUBMITTED_UNKNOWN_RESOLVED'
+                                 AND json_extract(payload_json,'$.result')='CONFIRMED_ABSENT')""",
+                        (order_id, order_id),
+                    ).fetchone()[0]
+                    releases = [
+                        (row[0], row[1], SQLiteLedger._strict_json(row[2]))
+                        for row in connection.execute(
+                            """SELECT sequence,event_id,payload_json FROM ledger_events
+                               WHERE aggregate_id=? AND event_type='RISK_RELEASED'
+                               ORDER BY sequence""",
+                            (order_id,),
+                        )
+                    ]
+                    lifecycle_rows = lifecycle.get(order_id, [])
+                    if lifecycle_rows:
+                        facts = tuple(row[2] for row in lifecycle_rows)
+                        projection = fold_broker_order(facts)
+                        opened = facts[0]
+                        assert type(opened) is BrokerOrderOpened
+                        ack = [
+                            (sequence, SQLiteLedger._strict_json(payload_json))
+                            for sequence, _, event_type, aggregate_id, _, payload_json in rows
+                            if aggregate_id == order_id and event_type == "ACKNOWLEDGED"
+                        ]
+                        order = order_rows.get(order_id)
+                        if len(ack) != 1 or ack[0][0] >= lifecycle_rows[0][0]:
+                            raise SchemaError("broker OPEN must follow exactly one ACK")
+                        if not isinstance(order, dict) or not isinstance(ack[0][1], dict):
+                            raise SchemaError("acknowledged broker order is malformed")
+                        SQLiteLedger._validate_open_against_submission(
+                            opened, order, ack[0][1].get("broker_order_id")
+                        )
+                        expected_plan = SQLiteLedger._lifecycle_release_plan(
+                            (cash, exposure, sell, side), facts
+                        )
+                        expected_releases = []
+                        for fact_id, release in expected_plan:
+                            fact_sequence = next(
+                                row[0] for row in lifecycle_rows
+                                if row[2].fact_id == fact_id
+                            )
+                            expected_releases.append(
+                                (
+                                    fact_sequence + 1,
+                                    f"risk-released:{fact_id}",
+                                    release,
+                                )
+                            )
+                        if releases != expected_releases:
+                            raise SchemaError(
+                                "broker lifecycle release order or amount is malformed"
+                            )
+                        if projection.order.execution_state not in {
+                            BrokerExecutionState.OPEN,
+                            BrokerExecutionState.PARTIALLY_FILLED,
+                        } and sum(item[2]["reserved_cash_minor"] for item in releases) != cash:
+                            raise SchemaError("terminal broker lifecycle did not fully release")
+                        if projection.order.execution_state not in {
+                            BrokerExecutionState.OPEN,
+                            BrokerExecutionState.PARTIALLY_FILLED,
+                        } and (
+                            sum(item[2]["reserved_exposure_minor"] for item in releases)
+                            != exposure
+                            or sum(
+                                item[2]["reserved_sell_quantity"] for item in releases
+                            ) != sell
+                        ):
+                            raise SchemaError("terminal broker lifecycle did not fully release")
+                        continue
+                    expected_release = {
+                        "reserved_cash_minor": cash,
+                        "reserved_exposure_minor": exposure,
+                        "reserved_sell_quantity": sell,
+                    }
+                    if (
+                        requires_full_release
+                        and [row[2] for row in releases] != [expected_release]
+                    ) or (not requires_full_release and releases):
+                        raise SchemaError(
+                            "terminal reservation state requires exactly one full release"
+                        )
         except SchemaError:
             raise
         except (
@@ -1641,6 +1886,247 @@ class SQLiteLedger:
             recorded_at,
         )
 
+    @staticmethod
+    def _lifecycle_release_plan(
+        reservation: tuple[int, int, int, str],
+        facts: tuple[BrokerLifecycleFact, ...],
+    ) -> tuple[tuple[str, dict[str, int]], ...]:
+        reserved_cash, reserved_exposure, reserved_sell, side = reservation
+        released_cash = released_exposure = released_sell = 0
+        plan: list[tuple[str, dict[str, int]]] = []
+        for index, fact in enumerate(facts[1:], start=1):
+            projection = fold_broker_order(facts[: index + 1])
+            terminal = projection.order.execution_state not in {
+                BrokerExecutionState.OPEN,
+                BrokerExecutionState.PARTIALLY_FILLED,
+            }
+            if terminal:
+                target_cash = reserved_cash
+                target_exposure = reserved_exposure
+                target_sell = reserved_sell
+            elif side == Side.BUY.value:
+                resolved = int(projection.order.filled)
+                requested = int(projection.order.requested)
+                target_exposure = reserved_exposure * resolved // requested
+                target_cash = target_exposure
+                target_sell = 0
+            else:
+                target_cash = target_exposure = 0
+                target_sell = int(projection.order.filled)
+            payload = {
+                "reserved_cash_minor": target_cash - released_cash,
+                "reserved_exposure_minor": target_exposure - released_exposure,
+                "reserved_sell_quantity": target_sell - released_sell,
+            }
+            if min(payload.values()) < 0:
+                raise ValueError("broker lifecycle release moved backwards")
+            plan.append((fact.fact_id, payload))
+            released_cash, released_exposure, released_sell = (
+                target_cash, target_exposure, target_sell
+            )
+        return tuple(plan)
+
+    @staticmethod
+    def _facts_for(
+        connection: sqlite3.Connection, client_order_id: str
+    ) -> tuple[BrokerLifecycleFact, ...]:
+        return tuple(
+            broker_fact_from_payload(SQLiteLedger._strict_json(payload))
+            for (payload,) in connection.execute(
+                f"""SELECT payload_json FROM ledger_events
+                    WHERE aggregate_id=? AND event_type IN
+                      ({','.join('?' for _ in BROKER_EVENT_TYPES)})
+                    ORDER BY sequence""",
+                (client_order_id, *sorted(BROKER_EVENT_TYPES)),
+            )
+        )
+
+    @staticmethod
+    def _validate_open_against_submission(
+        opened: BrokerOrderOpened,
+        order_payload: dict[str, object],
+        broker_order_id: str,
+    ) -> None:
+        request = order_payload.get("request")
+        if not isinstance(request, dict):
+            raise ValueError("reserved order request is malformed")
+        instrument = request.get("instrument")
+        expected_instrument = {
+            "market": opened.instrument.market,
+            "symbol": opened.instrument.symbol,
+            "currency": opened.instrument.currency,
+        }
+        try:
+            matches = (
+                opened.broker_order_ref.broker_order_id == broker_order_id
+                and opened.broker_order_ref.account_id == request["account_id"]
+                and opened.broker_order_ref.environment.value == order_payload["environment"]
+                and instrument == expected_instrument
+                and opened.side.value == request["side"]
+                and opened.requested_quantity == Decimal(request["quantity"])
+            )
+        except (KeyError, TypeError, InvalidOperation) as error:
+            raise ValueError("reserved order request is malformed") from error
+        if not matches:
+            raise ValueError("broker OPEN fact does not match acknowledged submission")
+
+    def record_broker_execution(self, fact: BrokerLifecycleFact) -> bool:
+        if type(fact) not in BROKER_LIFECYCLE_FACT_TYPES:
+            raise TypeError("exact typed broker lifecycle fact required")
+        payload = canonical_broker_fact_payload(fact)
+        event_type = BROKER_FACT_EVENTS[payload["kind"]]
+        recorded_at = datetime.now(timezone.utc).isoformat()
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            duplicate = self.connection.execute(
+                """SELECT event_type,aggregate_id,payload_json FROM ledger_events
+                   WHERE event_id=?""",
+                (fact.fact_id,),
+            ).fetchone()
+            if duplicate is not None:
+                if (
+                    duplicate[0] != event_type
+                    or duplicate[1] != fact.client_order_id
+                    or SQLiteLedger._strict_json(duplicate[2]) != payload
+                ):
+                    raise ValueError("broker fact ID has a different immutable payload")
+                if type(fact) is not BrokerOrderOpened:
+                    paired = self.connection.execute(
+                        """SELECT 1 FROM ledger_events cause
+                           JOIN ledger_events release ON release.sequence=cause.sequence+1
+                           WHERE cause.event_id=? AND release.event_type='RISK_RELEASED'
+                             AND release.event_id=?""",
+                        (fact.fact_id, f"risk-released:{fact.fact_id}"),
+                    ).fetchone()
+                    if paired is None:
+                        raise ValueError("broker fact is missing its atomic risk release")
+                self.connection.execute("COMMIT")
+                return False
+            order_row = self.connection.execute(
+                "SELECT canonical_json FROM order_requests WHERE client_order_id=?",
+                (fact.client_order_id,),
+            ).fetchone()
+            ack_rows = self.connection.execute(
+                """SELECT sequence,payload_json FROM ledger_events
+                   WHERE aggregate_id=? AND event_type='ACKNOWLEDGED'
+                   ORDER BY sequence""",
+                (fact.client_order_id,),
+            ).fetchall()
+            reservation = self.connection.execute(
+                """SELECT reserved_cash_minor,reserved_exposure_minor,
+                          reserved_sell_quantity,side
+                   FROM risk_reservations WHERE client_order_id=?""",
+                (fact.client_order_id,),
+            ).fetchone()
+            if order_row is None or len(ack_rows) != 1 or reservation is None:
+                raise ValueError("broker lifecycle requires one acknowledged reserved order")
+            order_payload = SQLiteLedger._strict_json(order_row[0])
+            ack_payload = SQLiteLedger._strict_json(ack_rows[0][1])
+            if not isinstance(order_payload, dict) or not isinstance(ack_payload, dict):
+                raise ValueError("acknowledged order payload is malformed")
+            broker_order_id = ack_payload.get("broker_order_id")
+            require_id(broker_order_id, "acknowledged broker_order_id")
+            prior_facts = self._facts_for(self.connection, fact.client_order_id)
+            if type(fact) is BrokerOrderOpened:
+                if prior_facts:
+                    raise ValueError("broker order OPEN is recorded exactly once")
+                self._validate_open_against_submission(fact, order_payload, broker_order_id)
+                for (existing_payload,) in self.connection.execute(
+                    """SELECT payload_json FROM ledger_events
+                       WHERE event_type='BROKER_ORDER_OPENED'"""
+                ):
+                    existing = broker_fact_from_payload(
+                        SQLiteLedger._strict_json(existing_payload)
+                    )
+                    assert type(existing) is BrokerOrderOpened
+                    if existing.broker_order_ref == fact.broker_order_ref:
+                        raise ValueError("broker order reference is already bound")
+            else:
+                if not prior_facts:
+                    raise ValueError("broker lifecycle must start with OPEN")
+                opened = prior_facts[0]
+                assert type(opened) is BrokerOrderOpened
+                self._validate_open_against_submission(
+                    opened, order_payload, broker_order_id
+                )
+                if type(fact) is BrokerFillObserved and self.connection.execute(
+                    """SELECT 1 FROM ledger_events
+                       WHERE event_type='BROKER_FILL_OBSERVED'
+                         AND json_extract(payload_json,'$.broker_execution_id')=?""",
+                    (fact.broker_execution_id,),
+                ).fetchone():
+                    raise ValueError("broker execution ID is already recorded")
+            candidate = (*prior_facts, fact)
+            fold_broker_order(candidate)
+            expected_plan = self._lifecycle_release_plan(reservation, candidate)
+            prior_releases = self.connection.execute(
+                """SELECT event_id,payload_json FROM ledger_events
+                   WHERE aggregate_id=? AND event_type='RISK_RELEASED'
+                   ORDER BY sequence""",
+                (fact.client_order_id,),
+            ).fetchall()
+            expected_prior = expected_plan[:-1] if type(fact) is not BrokerOrderOpened else ()
+            if tuple(
+                (row[0], SQLiteLedger._strict_json(row[1])) for row in prior_releases
+            ) != tuple(
+                (f"risk-released:{fact_id}", release)
+                for fact_id, release in expected_prior
+            ):
+                raise ValueError("existing lifecycle releases do not match broker facts")
+            self._insert_event(
+                LedgerEvent(
+                    fact.fact_id, event_type, fact.client_order_id,
+                    fact.occurred_at, payload,
+                ),
+                recorded_at,
+            )
+            if type(fact) is not BrokerOrderOpened:
+                _, release = expected_plan[-1]
+                self._insert_event(
+                    LedgerEvent(
+                        f"risk-released:{fact.fact_id}", "RISK_RELEASED",
+                        fact.client_order_id, fact.occurred_at, release,
+                    ),
+                    recorded_at,
+                )
+            self.connection.execute("COMMIT")
+            return True
+        except BaseException:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
+
+    def broker_order_projection(
+        self, client_order_id: str
+    ) -> BrokerLifecycleProjection | None:
+        require_id(client_order_id, "client_order_id")
+        facts = self._facts_for(self.connection, client_order_id)
+        return None if not facts else fold_broker_order(facts)
+
+    def broker_lifecycle_facts(
+        self,
+        account_id: str,
+        environment: TradingEnvironment,
+    ) -> tuple[BrokerLifecycleFact, ...]:
+        require_id(account_id, "account_id")
+        if type(environment) is not TradingEnvironment:
+            raise ValueError("environment must be TradingEnvironment")
+        return tuple(
+            broker_fact_from_payload(self._strict_json(payload))
+            for (payload,) in self.connection.execute(
+                f"""SELECT event.payload_json
+                      FROM ledger_events event
+                      JOIN risk_reservations reservation
+                        ON reservation.client_order_id=event.aggregate_id
+                     WHERE reservation.account_id=?
+                       AND reservation.environment=?
+                       AND event.event_type IN
+                         ({','.join('?' for _ in BROKER_EVENT_TYPES)})
+                     ORDER BY event.sequence""",
+                (account_id, environment.value, *sorted(BROKER_EVENT_TYPES)),
+            )
+        )
+
     def reserve_submission(
         self,
         client_order_id: str,
@@ -1662,6 +2148,39 @@ class SQLiteLedger:
             raise ValueError("reservation requires matching PREPARED and SUBMISSION_STARTED events")
         require_utc(prepared_event.occurred_at, "occurred_at")
         require_utc(started_event.occurred_at, "occurred_at")
+        try:
+            normalized_payload = self._strict_json(
+                self._json(canonical_payload, canonical=True)
+            )
+            if not isinstance(normalized_payload, dict):
+                raise ValueError("canonical order payload must be an object")
+            for section, fields in (
+                ("request", ("quantity",)),
+                ("risk", ("original_quantity", "approved_quantity")),
+                (
+                    "intent",
+                    (
+                        "target_quantity", "current_quantity", "open_quantity",
+                        "original_quantity",
+                    ),
+                ),
+                ("plan", ("quantity",)),
+            ):
+                values = normalized_payload.get(section)
+                if not isinstance(values, dict):
+                    continue
+                for field in fields:
+                    value = values.get(field)
+                    if value is None:
+                        continue
+                    if isinstance(value, bool):
+                        raise ValueError("share quantity cannot be bool")
+                    values[field] = canonical_share_quantity(
+                        Decimal(str(value)), f"{section}.{field}"
+                    )
+            canonical_payload = normalized_payload
+        except (InvalidOperation, TypeError, ValueError) as error:
+            raise ValueError("canonical order share quantity is invalid") from error
         permit = canonical_payload.get("permit")
         if isinstance(permit, Mapping):
             canonical_permit_id = permit.get("permit_id")
@@ -1684,7 +2203,8 @@ class SQLiteLedger:
                     "currency": reservation_terms.instrument.currency,
                 }
                 or request["side"] != reservation_terms.side.value
-                or int(request["quantity"]) != reservation_terms.quantity
+                or Decimal(request["quantity"]) != reservation_terms.quantity
+                or request["quantity"] != str(reservation_terms.quantity)
                 or risk["input_snapshot_id"] != reservation_terms.account_snapshot_id
                 or risk["policy_version"] != reservation_terms.policy_version
                 or canonical_payload["environment"] != reservation_terms.environment.value
@@ -1741,6 +2261,8 @@ class SQLiteLedger:
                 """SELECT 1 FROM order_requests o
                    WHERE o.rowid <= ?
                      AND json_extract(o.canonical_json,'$.request.account_id') = ?
+                     AND (json_type(o.canonical_json,'$.environment') IS NULL
+                       OR json_extract(o.canonical_json,'$.environment') = ?)
                      AND NOT EXISTS (SELECT 1 FROM risk_reservations r
                        WHERE r.client_order_id=o.client_order_id)
                      AND COALESCE((SELECT e.event_type FROM ledger_events e
@@ -1753,7 +2275,10 @@ class SQLiteLedger:
                          AND resolved.event_type='SUBMITTED_UNKNOWN_RESOLVED'
                          AND json_extract(resolved.payload_json,'$.result')='CONFIRMED_ABSENT')
                    LIMIT 1""",
-                (cutoff, reservation_terms.account_id),
+                (
+                    cutoff, reservation_terms.account_id,
+                    reservation_terms.environment.value,
+                ),
             ).fetchone()
             if legacy_blocker is not None:
                 raise ReservationCapacityExceeded(
@@ -1769,8 +2294,11 @@ class SQLiteLedger:
                      SUM(json_extract(payload_json,'$.reserved_exposure_minor')) exposure
                      FROM ledger_events WHERE event_type='RISK_RELEASED'
                      GROUP BY aggregate_id) rel ON rel.aggregate_id=r.client_order_id
-                   WHERE r.account_id=?""",
-                (reservation_terms.account_id,),
+                   WHERE r.account_id=? AND r.environment=?""",
+                (
+                    reservation_terms.account_id,
+                    reservation_terms.environment.value,
+                ),
             ).fetchone()
             active_sell = int(self.connection.execute(
                 """SELECT COALESCE(SUM(r.reserved_sell_quantity - COALESCE(rel.qty,0)),0)
@@ -1779,9 +2307,11 @@ class SQLiteLedger:
                      SUM(json_extract(payload_json,'$.reserved_sell_quantity')) qty
                      FROM ledger_events WHERE event_type='RISK_RELEASED'
                      GROUP BY aggregate_id) rel ON rel.aggregate_id=r.client_order_id
-                   WHERE r.account_id=? AND r.market=? AND r.symbol=?""",
+                   WHERE r.account_id=? AND r.environment=?
+                     AND r.market=? AND r.symbol=?""",
                 (
-                    reservation_terms.account_id, reservation_terms.instrument.market,
+                    reservation_terms.account_id, reservation_terms.environment.value,
+                    reservation_terms.instrument.market,
                     reservation_terms.instrument.symbol,
                 ),
             ).fetchone()[0])
@@ -1883,7 +2413,12 @@ class SQLiteLedger:
         if (
             event.event_type.startswith("OPERATOR_COMMAND_")
             or event.event_type == "SUBMITTED_UNKNOWN_RESOLVED"
-            or event.event_type in {"RISK_RESERVED", "RISK_RELEASED"}
+            or event.event_type in {
+                "PREPARED", "SUBMISSION_STARTED", "ACKNOWLEDGED",
+                "SUBMISSION_REJECTED", "SUBMITTED_UNKNOWN",
+                "RISK_RESERVED", "RISK_RELEASED",
+            }
+            or event.event_type in BROKER_EVENT_TYPES
         ):
             raise ValueError("audited events require their dedicated ledger operation")
         try:
@@ -1896,24 +2431,24 @@ class SQLiteLedger:
             raise
 
     @staticmethod
-    def canonical_command(command: OperatorCommand) -> dict[str, object]:
-        return {
-            "command_id": command.command_id, "actor": command.actor, "reason": command.reason,
-            "deployment_version": command.deployment_version,
-            "expected_safety_epoch": command.expected_safety_epoch,
-            "requested_at": command.requested_at.isoformat(),
-            "expires_at": command.expires_at.isoformat(), "action": command.action.value,
-            "account_id": command.account_id,
-            "environment": command.environment.value,
-            "client_order_id": command.client_order_id,
-            "risk_decision_id": command.risk_decision_id,
-            "execution_plan_id": command.execution_plan_id,
-        }
+    def canonical_command(
+        command: OperatorCommand,
+        cancellation: CancelOrderCommand | None = None,
+    ) -> dict[str, object]:
+        return canonical_operator_command(command, cancellation)
 
-    def reserve_operator_command(self, command: OperatorCommand, event: LedgerEvent) -> None:
+    def reserve_operator_command(
+        self,
+        command: OperatorCommand,
+        event: LedgerEvent,
+        cancellation: CancelOrderCommand | None = None,
+    ) -> None:
         require_id(event.event_id, "event_id")
         require_utc(event.occurred_at, "occurred_at")
-        expected_payload = {**self.canonical_command(command), "previous_state": event.payload.get("previous_state")}
+        canonical = self.canonical_command(command, cancellation)
+        if (command.action is OperatorAction.ISSUE_CANCEL) != (cancellation is not None):
+            raise ValueError("ISSUE_CANCEL requires an exact cancellation command")
+        expected_payload = {**canonical, "previous_state": event.payload.get("previous_state")}
         if (
             event.event_type != "OPERATOR_COMMAND_REQUESTED"
             or event.aggregate_id != command.command_id
@@ -1930,7 +2465,7 @@ class SQLiteLedger:
                 raise OperatorCommandConflict("operator command ID has already been used")
             self.connection.execute(
                 "INSERT INTO operator_commands VALUES (?, ?, ?)",
-                (command.command_id, self._json(self.canonical_command(command), canonical=True), recorded_at),
+                (command.command_id, self._json(canonical, canonical=True), recorded_at),
             )
             self._insert_event(event, recorded_at)
             self.connection.execute("COMMIT")
@@ -1988,8 +2523,7 @@ class SQLiteLedger:
                 raise ValueError("operator command was not reserved")
             command_payload = json.loads(command_row[0])
             action = OperatorAction(command_payload["action"])
-            permit_action = action in {
-                OperatorAction.ISSUE_CANCEL,
+            other_permit_action = action in {
                 OperatorAction.ISSUE_REDUCE_ONLY,
                 OperatorAction.ISSUE_EMERGENCY_FLATTEN,
             }
@@ -2001,11 +2535,28 @@ class SQLiteLedger:
                     or permit_id is not None
                 )
             ) or (
-                permit_action
+                action is OperatorAction.ISSUE_CANCEL
+                and outcome is OperatorCommandOutcome.SUCCEEDED
+                and (
+                    permit_id is None
+                    or order_id is None
+                    or not self._cancel_binding_is_valid(command_payload)
+                    or order_id
+                    != command_payload["cancel_order"]["target"]["broker_order_id"]
+                )
+            ) or (
+                other_permit_action
                 and outcome is OperatorCommandOutcome.SUCCEEDED
                 and (permit_id is None or order_id is not None)
             ) or (
-                (not permit_action or outcome is OperatorCommandOutcome.FAILED)
+                (
+                    action not in {
+                        OperatorAction.ISSUE_CANCEL,
+                        OperatorAction.ISSUE_REDUCE_ONLY,
+                        OperatorAction.ISSUE_EMERGENCY_FLATTEN,
+                    }
+                    or outcome is OperatorCommandOutcome.FAILED
+                )
                 and action is not OperatorAction.RESOLVE_SUBMITTED_UNKNOWN
                 and (permit_id is not None or order_id is not None)
             ):
@@ -2363,6 +2914,9 @@ class SQLiteLedger:
             digest.update(statement.encode("utf-8"))
             digest.update(b"\n")
         return digest.hexdigest()
+
+    def content_digest(self) -> str:
+        return self._content_digest(self.connection)
 
     def backup(self, destination: str | Path, *, app_version: str) -> Path:
         require_id(app_version, "app_version")
