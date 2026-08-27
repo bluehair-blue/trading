@@ -6,13 +6,18 @@ from typing import TypeVar
 from uuid import uuid4
 
 from trader.application.safety import SafetyController
+from trader.domain.cancellation import CancelOrderCommand, CancelPermit
+from trader.domain.broker_observations import (
+    TYPED_UNKNOWN_RESOLUTION_TYPES,
+    TypedUnknownResolutionEvidence,
+    canonical_resolution_payload,
+)
 from trader.domain.models import (
     OperatorAction,
     OperatorCommand,
     OperatorCommandOutcome,
     PermitScope,
     TradingPermit,
-    UnknownResolutionEvidence,
     require_id,
     require_utc,
 )
@@ -88,6 +93,7 @@ class OperatorCommandService:
                 "expires_at": command.expires_at.isoformat(),
                 "action": command.action.value,
                 "account_id": command.account_id,
+                "environment": command.environment.value,
                 "client_order_id": command.client_order_id,
                 "risk_decision_id": command.risk_decision_id,
                 "execution_plan_id": command.execution_plan_id,
@@ -129,7 +135,11 @@ class OperatorCommandService:
             command,
             OperatorCommandOutcome.SUCCEEDED,
             None,
-            related_permit_id=result.permit_id if isinstance(result, TradingPermit) else None,
+            related_permit_id=(
+                result.permit_id
+                if isinstance(result, (TradingPermit, CancelPermit))
+                else None
+            ),
             related_order_id=related_order_id,
         )
         return result
@@ -142,6 +152,8 @@ class OperatorCommandService:
             raise OperatorCommandRejected("operator action does not match the requested operation")
         if command.deployment_version != self.deployment_version:
             raise OperatorCommandRejected("operator command deployment version is stale")
+        if command.environment is not self.safety.environment:
+            raise OperatorCommandRejected("operator command environment does not match safety")
         if command.expected_safety_epoch != self.safety.epoch:
             raise OperatorCommandRejected("operator command safety epoch is stale")
         if now < command.requested_at or now >= command.expires_at:
@@ -245,15 +257,35 @@ class OperatorCommandService:
             lambda now: self.safety._issue_high_risk_permit(command.account_id, scope, now),
         )
 
+    def issue_cancel_permit(
+        self,
+        command: OperatorCommand,
+        cancellation: CancelOrderCommand,
+    ) -> CancelPermit:
+        """Authorize one typed, process-local cancellation command."""
+        if type(cancellation) is not CancelOrderCommand:
+            raise TypeError("exact CancelOrderCommand is required")
+        if (
+            cancellation.target.account_id != command.account_id
+            or cancellation.target.environment is not command.environment
+        ):
+            raise OperatorCommandRejected("cancellation target does not match operator command")
+        return self._execute(
+            command,
+            OperatorAction.ISSUE_CANCEL,
+            lambda now: self.safety._issue_cancel_permit(cancellation, now),
+            related_order_id=cancellation.target.broker_order_id,
+        )
+
     def resolve_unknown_submission(
         self,
         command: OperatorCommand,
         client_order_id: str,
-        evidence: UnknownResolutionEvidence,
+        evidence: TypedUnknownResolutionEvidence,
     ) -> None:
         if type(command) is not OperatorCommand:
             raise TypeError("operator action requires an OperatorCommand")
-        if type(evidence) is not UnknownResolutionEvidence:
+        if type(evidence) not in TYPED_UNKNOWN_RESOLUTION_TYPES:
             raise TypeError("typed unknown-resolution evidence is required")
         if command.client_order_id != client_order_id:
             raise OperatorCommandRejected(
@@ -264,7 +296,7 @@ class OperatorCommandService:
             blocker = f"SUBMITTED_UNKNOWN:{client_order_id}"
             if blocker not in self.safety.blockers:
                 raise OperatorCommandRejected("unknown submission is not blocked")
-            if evidence.observed_at > now:
+            if evidence.evidence.fetched_at > now:
                 raise OperatorCommandRejected(
                     "unknown-resolution evidence cannot be observed in the future"
                 )
@@ -273,13 +305,7 @@ class OperatorCommandService:
                 "SUBMITTED_UNKNOWN_RESOLVED",
                 client_order_id,
                 now,
-                {
-                    "operator_command_id": command.command_id,
-                    "result": evidence.result.value,
-                    "observation": evidence.observation,
-                    "reference": evidence.reference,
-                    "observed_at": evidence.observed_at.isoformat(),
-                },
+                canonical_resolution_payload(command.command_id, evidence),
             )
             try:
                 self.ledger.record_unknown_resolution(

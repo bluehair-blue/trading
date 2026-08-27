@@ -1,6 +1,6 @@
 # 키움 Open API 약관 검토와 구현 통제
 
-> 검토 기준일: 2026-08-25  
+> 검토 기준일: 2026-08-27
 > 이 문서는 구현 범위를 정하기 위한 기술·운영 검토이며 법률 자문이 아니다.
 
 ## 1. 적용 범위 결론
@@ -47,7 +47,7 @@
 
 | 약관·운영 위험 | 시스템 통제 |
 |---|---|
-| Key·Secret·계좌번호 유출 | `.env`만 사용하고 Git·로그·원장·예외·테스트 출력에서 차단; 도메인은 내부 계좌 별칭만 사용 |
+| Key·Secret·계좌번호 유출 | 명시적으로 선택한 실전·모의별 권한 제한 credential JSON을 adapter에서만 읽고 Git·로그·원장·예외·테스트 출력에서 차단; 도메인은 내부 계좌 별칭만 사용 |
 | 시세 제3자 제공 | 연구·로그·대시보드 경계를 개인 로컬/운영 계정 안으로 제한; 원시 시세 외부 전송 금지 |
 | API/TR 변경 | 키움 어댑터에 TR·필드 매핑 집중; 명세 snapshot과 계약 테스트; 배포 전 공지 확인 |
 | 호출 제한·차단 | 주문·조회·환전·차트·종목목록별 limiter와 피크타임 정책; 제한 오류 기록 |
@@ -63,14 +63,17 @@ REST 구현에는 해외파생 문서의 팝업 자동 처리나 별도 해외�
 
 ## 4. 구현·운영 게이트
 
-### 지금 허용되는 Phase 1A
+### 지금 허용되는 오프라인 구현 범위
 
-- 순수 도메인 계약, 위험 규칙, SafetyController
-- FakeBroker와 append-only 로컬 원장
-- 중복·확정 거절·불확정 주문·재시작 안전 테스트
-- `.env`의 Git 차단과 blank example
+- 순수 도메인 계약, 위험 규칙, 공통 모드 SafetyController와 permit
+- StubBroker·SimulatedBroker와 append-only 로컬 원장
+- 구조화 read-only mapper, WebSocket supervisor, limiter, reconciliation의 주입식 계약 테스트
+- 한 번만 호출하는 mutation 결과 분류와 typed UNKNOWN 증거 테스트
+- 실전·모의 분리 credential loader와 저장소 비밀정보 scanner
 
-Phase 1A는 `.env`를 읽지 않으며 네트워크와 실전·모의 주문 엔드포인트를 포함하지 않는다.
+현재 코드는 실제 credential을 읽어 네트워크에 연결하지 않았으며 실전·모의 주문 endpoint도
+조립하지 않는다. 합성 응답과 주입 transport를 사용한 검증을 브로커 연결 증거로 간주하지
+않는다.
 
 ### 키움 연동 전 필수 확인
 

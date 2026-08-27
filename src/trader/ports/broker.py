@@ -3,7 +3,8 @@ from enum import StrEnum
 import re
 from typing import Protocol
 
-from trader.domain.models import OrderRequest
+from trader.domain.cancellation import CancelOrderCommand
+from trader.domain.models import OrderRequest, TradingEnvironment
 
 
 class BrokerSubmitOutcome(StrEnum):
@@ -12,10 +13,13 @@ class BrokerSubmitOutcome(StrEnum):
     UNKNOWN = "UNKNOWN"
 
 
-class BrokerEnvironment(StrEnum):
-    SIMULATED = "SIMULATED"
-    PAPER = "PAPER"
-    LIVE = "LIVE"
+class BrokerCancelOutcome(StrEnum):
+    ACK = "ACK"
+    DEFINITE_REJECTED = "DEFINITE_REJECTED"
+    UNKNOWN = "UNKNOWN"
+
+
+BrokerEnvironment = TradingEnvironment
 
 
 @dataclass(frozen=True)
@@ -36,7 +40,25 @@ class BrokerSubmitResult:
             raise ValueError("detail_code must be a bounded uppercase safe code")
 
 
+@dataclass(frozen=True)
+class BrokerCancelResult:
+    outcome: BrokerCancelOutcome
+    detail_code: str = ""
+
+    def __post_init__(self) -> None:
+        if type(self.outcome) is not BrokerCancelOutcome:
+            raise ValueError("outcome must be BrokerCancelOutcome")
+        if self.detail_code and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", self.detail_code) is None:
+            raise ValueError("detail_code must be a bounded uppercase safe code")
+
+
 class Broker(Protocol):
     environment: BrokerEnvironment
 
     def submit(self, request: OrderRequest) -> BrokerSubmitResult: ...
+
+
+class OrderCancellation(Protocol):
+    environment: BrokerEnvironment
+
+    def cancel(self, command: CancelOrderCommand) -> BrokerCancelResult: ...

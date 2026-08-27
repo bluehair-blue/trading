@@ -2,10 +2,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Mapping, Protocol
 
+from trader.domain.broker_observations import TypedUnknownResolutionEvidence
 from trader.domain.models import (
     OperatorCommand,
     OperatorCommandOutcome,
-    UnknownResolutionEvidence,
+    ReservationTerms,
+    TradingEnvironment,
 )
 
 
@@ -20,6 +22,10 @@ class LedgerEvent:
 
 class OrderReservationConflict(RuntimeError):
     pass
+
+
+class ReservationCapacityExceeded(OrderReservationConflict):
+    """The account's durable active reservations exhaust a stated capacity."""
 
 
 class PermitAlreadyConsumed(RuntimeError):
@@ -43,8 +49,10 @@ class Ledger(Protocol):
         canonical_payload: Mapping[str, object],
         prepared_event: LedgerEvent,
         started_event: LedgerEvent,
-        permit_id: str | None,
+        permit_id: str,
+        reservation_terms: ReservationTerms,
     ) -> bool: ...
+    def complete_submission(self, terminal_event: LedgerEvent) -> None: ...
     def append(self, event: LedgerEvent) -> None: ...
     def reserve_operator_command(
         self, command: OperatorCommand, requested_event: LedgerEvent
@@ -60,12 +68,26 @@ class Ledger(Protocol):
         self,
         client_order_id: str,
         command: OperatorCommand,
-        evidence: UnknownResolutionEvidence,
+        evidence: TypedUnknownResolutionEvidence,
         event: LedgerEvent,
     ) -> None: ...
     def events_for(self, aggregate_id: str) -> tuple[LedgerEvent, ...]: ...
-    def incomplete_submissions(self, account_id: str | None = None) -> tuple[str, ...]: ...
-    def unresolved_unknown_submissions(
-        self, account_id: str | None = None,
+    def incomplete_submissions(
+        self,
+        account_id: str | None = None,
+        environment: TradingEnvironment | None = None,
     ) -> tuple[str, ...]: ...
-    def integrity_check(self) -> bool: ...
+    def unresolved_unknown_submissions(
+        self,
+        account_id: str | None = None,
+        environment: TradingEnvironment | None = None,
+    ) -> tuple[str, ...]: ...
+    def physical_integrity_check(self) -> bool: ...
+    def foreign_key_check(self) -> bool: ...
+    def schema_contract_check(self) -> bool: ...
+    def audit_semantic_check(self) -> bool: ...
+    def submission_state_check(self) -> bool: ...
+    def full_ledger_verify(self) -> bool: ...
+    def integrity_check(self) -> bool:
+        """Backward-compatible physical SQLite check; use full_ledger_verify for all checks."""
+        ...

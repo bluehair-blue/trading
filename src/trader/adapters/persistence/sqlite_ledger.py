@@ -7,15 +7,23 @@ import sqlite3
 import tempfile
 from collections.abc import Mapping
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+from trader.domain.broker_observations import (
+    ConfirmedAbsent,
+    TYPED_UNKNOWN_RESOLUTION_TYPES,
+    TypedUnknownResolutionEvidence,
+    canonical_resolution_payload,
+    resolution_from_payload,
+)
 from trader.domain.models import (
     OperatorAction,
     OperatorCommand,
     OperatorCommandOutcome,
     SafetyState,
-    UnknownResolutionEvidence,
-    UnknownResolutionResult,
+    ReservationTerms,
+    TradingEnvironment,
     require_id,
     require_utc,
 )
@@ -25,9 +33,10 @@ from trader.ports.ledger import (
     OperatorCommandConflict,
     OrderReservationConflict,
     PermitAlreadyConsumed,
+    ReservationCapacityExceeded,
 )
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 10
 TERMINAL_EVENTS = {
     OperatorCommandOutcome.SUCCEEDED: "OPERATOR_COMMAND_SUCCEEDED",
     OperatorCommandOutcome.FAILED: "OPERATOR_COMMAND_FAILED",
@@ -91,10 +100,19 @@ V6_OBJECTS = V3_OBJECTS | {
     "schema_metadata_no_update",
     "schema_metadata_no_delete",
 }
-CURRENT_OBJECTS = V6_OBJECTS | {
+V7_OBJECTS = V6_OBJECTS | {
     "order_request_permit_once",
     "submission_state_contract",
 }
+V8_OBJECTS = V7_OBJECTS | {
+    "order_environment_contract",
+    "operator_environment_contract",
+}
+V9_OBJECTS = V8_OBJECTS | {
+    "risk_reservations", "risk_reservations_no_update", "risk_reservations_no_delete",
+    "risk_reserved_once", "risk_event_contract",
+}
+CURRENT_OBJECTS = V9_OBJECTS
 TABLE_COLUMNS = {
     "ledger_events": (
         "sequence", "event_id", "event_type", "aggregate_id", "occurred_at", "recorded_at",
@@ -103,6 +121,14 @@ TABLE_COLUMNS = {
     "order_requests": ("client_order_id", "canonical_json", "reserved_at"),
     "operator_commands": ("command_id", "canonical_json", "reserved_at"),
     "schema_metadata": ("key", "value"),
+    "risk_reservations": (
+        "client_order_id", "account_id", "account_snapshot_id", "environment",
+        "policy_version", "market", "symbol", "account_currency",
+        "instrument_currency", "side", "quantity", "available_cash_minor",
+        "current_exposure_minor", "current_position_quantity", "cash_cap_minor",
+        "exposure_cap_minor", "fee_buffer_minor", "reserved_cash_minor",
+        "reserved_exposure_minor", "reserved_sell_quantity", "reserved_at",
+    ),
 }
 TABLE_INFO = {
     "ledger_events": (
@@ -127,6 +153,29 @@ TABLE_INFO = {
     "schema_metadata": (
         ("key", "TEXT", 0, None, 1),
         ("value", "TEXT", 1, None, 0),
+    ),
+    "risk_reservations": (
+        ("client_order_id", "TEXT", 0, None, 1),
+        ("account_id", "TEXT", 1, None, 0),
+        ("account_snapshot_id", "TEXT", 1, None, 0),
+        ("environment", "TEXT", 1, None, 0),
+        ("policy_version", "TEXT", 1, None, 0),
+        ("market", "TEXT", 1, None, 0),
+        ("symbol", "TEXT", 1, None, 0),
+        ("account_currency", "TEXT", 1, None, 0),
+        ("instrument_currency", "TEXT", 1, None, 0),
+        ("side", "TEXT", 1, None, 0),
+        ("quantity", "INTEGER", 1, None, 0),
+        ("available_cash_minor", "INTEGER", 1, None, 0),
+        ("current_exposure_minor", "INTEGER", 1, None, 0),
+        ("current_position_quantity", "INTEGER", 1, None, 0),
+        ("cash_cap_minor", "INTEGER", 1, None, 0),
+        ("exposure_cap_minor", "INTEGER", 1, None, 0),
+        ("fee_buffer_minor", "INTEGER", 1, None, 0),
+        ("reserved_cash_minor", "INTEGER", 1, None, 0),
+        ("reserved_exposure_minor", "INTEGER", 1, None, 0),
+        ("reserved_sell_quantity", "INTEGER", 1, None, 0),
+        ("reserved_at", "TEXT", 1, None, 0),
     ),
 }
 LEGACY_STATEMENTS = (
@@ -430,6 +479,366 @@ V7_STATEMENTS = (
     "DROP TRIGGER unknown_resolution_contract",
     V7_RESOLUTION_SQL,
 )
+V8_STATEMENTS = (
+    """CREATE TRIGGER order_environment_contract BEFORE INSERT ON order_requests
+        BEGIN
+          SELECT CASE WHEN
+            json_type(NEW.canonical_json, '$.environment') IS NOT 'text'
+            OR json_extract(NEW.canonical_json, '$.environment') NOT IN
+              ('SIMULATED','PAPER','LIVE')
+            OR json_type(NEW.canonical_json, '$.permit') IS NOT 'object'
+            OR json_type(NEW.canonical_json, '$.permit.permit_id') IS NOT 'text'
+            OR trim(json_extract(NEW.canonical_json, '$.permit.permit_id')) = ''
+            OR json_type(NEW.canonical_json, '$.permit.environment') IS NOT 'text'
+            OR json_extract(NEW.canonical_json, '$.permit.environment') IS NOT
+              json_extract(NEW.canonical_json, '$.environment')
+            OR json_type(NEW.canonical_json,
+              '$.risk.input_snapshot_environment') IS NOT 'text'
+            OR json_extract(NEW.canonical_json,
+              '$.risk.input_snapshot_environment') IS NOT
+              json_extract(NEW.canonical_json, '$.environment')
+            OR json_type(NEW.canonical_json,
+              '$.plan.market_evidence.environment') IS NOT 'text'
+            OR json_extract(NEW.canonical_json,
+              '$.plan.market_evidence.environment') IS NOT
+              json_extract(NEW.canonical_json, '$.environment')
+            OR json_type(NEW.canonical_json,
+              '$.plan.market_evidence.pricing_policy_version') IS NOT 'text'
+            OR json_extract(NEW.canonical_json,
+              '$.plan.market_evidence.pricing_policy_version') IS NOT
+              json_extract(NEW.canonical_json, '$.plan.pricing_policy_version')
+            OR json_extract(NEW.canonical_json, '$.plan.pricing_policy_version') IS NOT
+              json_extract(NEW.canonical_json, '$.risk.policy_version')
+            OR json_extract(NEW.canonical_json, '$.risk.policy_version') IS NOT
+              json_extract(NEW.canonical_json, '$.permit.policy_version')
+            OR json_type(NEW.canonical_json,
+              '$.plan.market_evidence.snapshot_id') IS NOT 'text'
+            OR trim(json_extract(NEW.canonical_json,
+              '$.plan.market_evidence.snapshot_id')) = ''
+            OR json_extract(NEW.canonical_json,
+              '$.plan.market_evidence.snapshot_id') IS NOT
+              json_extract(NEW.canonical_json, '$.permit.market_snapshot_id')
+            OR json_extract(NEW.canonical_json,
+              '$.plan.market_evidence.quality') IS NOT 'CONSISTENT'
+            OR json_type(NEW.canonical_json,
+              '$.plan.market_evidence.observed_at') IS NOT 'text'
+            OR substr(json_extract(NEW.canonical_json,
+              '$.plan.market_evidence.observed_at'), -6) != '+00:00'
+            OR julianday(json_extract(NEW.canonical_json,
+              '$.plan.market_evidence.observed_at')) IS NULL
+            OR json_type(NEW.canonical_json,
+              '$.plan.market_evidence.minimum_limit_price') IS NOT 'text'
+            OR json_extract(NEW.canonical_json,
+              '$.plan.market_evidence.minimum_limit_price') IS NOT
+              json_extract(NEW.canonical_json, '$.plan.minimum_limit_price')
+            OR json_type(NEW.canonical_json,
+              '$.plan.market_evidence.maximum_limit_price') IS NOT 'text'
+            OR json_extract(NEW.canonical_json,
+              '$.plan.market_evidence.maximum_limit_price') IS NOT
+              json_extract(NEW.canonical_json, '$.plan.maximum_limit_price')
+            OR CAST(json_extract(NEW.canonical_json,
+              '$.plan.market_evidence.minimum_limit_price') AS REAL) <= 0
+            OR CAST(json_extract(NEW.canonical_json,
+              '$.plan.market_evidence.maximum_limit_price') AS REAL) <
+              CAST(json_extract(NEW.canonical_json,
+                '$.plan.market_evidence.minimum_limit_price') AS REAL)
+          THEN RAISE(ABORT, 'invalid order environment contract') END;
+        END""",
+    """CREATE TRIGGER operator_environment_contract BEFORE INSERT ON operator_commands
+        BEGIN
+          SELECT CASE WHEN
+            json_type(NEW.canonical_json, '$.environment') IS NOT 'text'
+            OR json_extract(NEW.canonical_json, '$.environment') NOT IN
+              ('SIMULATED','PAPER','LIVE')
+          THEN RAISE(ABORT, 'invalid operator environment contract') END;
+        END""",
+)
+V9_STATEMENTS = (
+    """CREATE TABLE risk_reservations (
+        client_order_id TEXT PRIMARY KEY,
+        account_id TEXT NOT NULL, account_snapshot_id TEXT NOT NULL,
+        environment TEXT NOT NULL CHECK(environment IN ('SIMULATED','PAPER','LIVE')),
+        policy_version TEXT NOT NULL, market TEXT NOT NULL, symbol TEXT NOT NULL,
+        account_currency TEXT NOT NULL CHECK(account_currency = 'USD'),
+        instrument_currency TEXT NOT NULL CHECK(instrument_currency = account_currency),
+        side TEXT NOT NULL CHECK(side IN ('BUY','SELL')),
+        quantity INTEGER NOT NULL CHECK(typeof(quantity)='integer' AND quantity BETWEEN 1 AND 9223372036854775807),
+        available_cash_minor INTEGER NOT NULL CHECK(typeof(available_cash_minor)='integer' AND available_cash_minor BETWEEN 0 AND 9223372036854775807),
+        current_exposure_minor INTEGER NOT NULL CHECK(typeof(current_exposure_minor)='integer' AND current_exposure_minor BETWEEN 0 AND 9223372036854775807),
+        current_position_quantity INTEGER NOT NULL CHECK(typeof(current_position_quantity)='integer' AND current_position_quantity BETWEEN 0 AND 9223372036854775807),
+        cash_cap_minor INTEGER NOT NULL CHECK(typeof(cash_cap_minor)='integer' AND cash_cap_minor BETWEEN 0 AND 9223372036854775807),
+        exposure_cap_minor INTEGER NOT NULL CHECK(typeof(exposure_cap_minor)='integer' AND exposure_cap_minor BETWEEN 0 AND 9223372036854775807),
+        fee_buffer_minor INTEGER NOT NULL CHECK(typeof(fee_buffer_minor)='integer' AND fee_buffer_minor BETWEEN 0 AND 9223372036854775807),
+        reserved_cash_minor INTEGER NOT NULL CHECK(typeof(reserved_cash_minor)='integer' AND reserved_cash_minor BETWEEN 0 AND 9223372036854775807),
+        reserved_exposure_minor INTEGER NOT NULL CHECK(typeof(reserved_exposure_minor)='integer' AND reserved_exposure_minor BETWEEN 0 AND 9223372036854775807),
+        reserved_sell_quantity INTEGER NOT NULL CHECK(typeof(reserved_sell_quantity)='integer' AND reserved_sell_quantity BETWEEN 0 AND 9223372036854775807),
+        reserved_at TEXT NOT NULL,
+        CHECK(length(trim(account_id)) > 0 AND length(trim(account_snapshot_id)) > 0
+          AND length(trim(policy_version)) > 0 AND length(trim(market)) > 0
+          AND length(trim(symbol)) > 0 AND substr(reserved_at, -6) = '+00:00'
+          AND julianday(reserved_at) IS NOT NULL),
+        CHECK((side='BUY' AND reserved_exposure_minor > 0
+          AND reserved_cash_minor = reserved_exposure_minor + fee_buffer_minor
+          AND reserved_sell_quantity = 0)
+          OR (side='SELL' AND reserved_cash_minor=0 AND reserved_exposure_minor=0
+          AND fee_buffer_minor=0 AND reserved_sell_quantity=quantity))
+        )""",
+    """CREATE TRIGGER risk_reservations_no_update BEFORE UPDATE ON risk_reservations
+        BEGIN SELECT RAISE(ABORT, 'risk reservations are immutable'); END""",
+    """CREATE TRIGGER risk_reservations_no_delete BEFORE DELETE ON risk_reservations
+        BEGIN SELECT RAISE(ABORT, 'risk reservations are immutable'); END""",
+    """CREATE UNIQUE INDEX risk_reserved_once ON ledger_events(aggregate_id)
+        WHERE event_type = 'RISK_RESERVED'""",
+    """CREATE TRIGGER risk_event_contract BEFORE INSERT ON ledger_events
+        WHEN NEW.event_type IN ('RISK_RESERVED','RISK_RELEASED')
+        BEGIN
+          SELECT CASE WHEN trim(NEW.event_id) = '' OR substr(NEW.occurred_at, -6) != '+00:00'
+            OR julianday(NEW.occurred_at) IS NULL
+            OR (SELECT COUNT(*) FROM json_each(NEW.payload_json)) != 3
+            OR (SELECT COUNT(DISTINCT key) FROM json_each(NEW.payload_json)) != 3
+            OR EXISTS (SELECT 1 FROM json_each(NEW.payload_json) WHERE key NOT IN
+              ('reserved_cash_minor','reserved_exposure_minor','reserved_sell_quantity'))
+            OR json_type(NEW.payload_json, '$.reserved_cash_minor') IS NOT 'integer'
+            OR json_type(NEW.payload_json, '$.reserved_exposure_minor') IS NOT 'integer'
+            OR json_type(NEW.payload_json, '$.reserved_sell_quantity') IS NOT 'integer'
+            OR json_extract(NEW.payload_json, '$.reserved_cash_minor') < 0
+            OR json_extract(NEW.payload_json, '$.reserved_exposure_minor') < 0
+            OR json_extract(NEW.payload_json, '$.reserved_sell_quantity') < 0
+            OR NOT EXISTS (SELECT 1 FROM risk_reservations r
+              WHERE r.client_order_id = NEW.aggregate_id)
+          THEN RAISE(ABORT, 'invalid risk event') END;
+          SELECT CASE WHEN NEW.event_type='RISK_RESERVED' AND NOT EXISTS (
+            SELECT 1 FROM risk_reservations r WHERE r.client_order_id=NEW.aggregate_id
+              AND r.reserved_cash_minor=json_extract(NEW.payload_json,'$.reserved_cash_minor')
+              AND r.reserved_exposure_minor=json_extract(NEW.payload_json,'$.reserved_exposure_minor')
+              AND r.reserved_sell_quantity=json_extract(NEW.payload_json,'$.reserved_sell_quantity'))
+          THEN RAISE(ABORT, 'risk reserve payload mismatch') END;
+          SELECT CASE WHEN NEW.event_type='RISK_RELEASED' AND (
+            NOT EXISTS (SELECT 1 FROM ledger_events e WHERE e.aggregate_id=NEW.aggregate_id
+              AND e.event_type='RISK_RESERVED')
+            OR json_extract(NEW.payload_json,'$.reserved_cash_minor')
+              + COALESCE((SELECT SUM(json_extract(e.payload_json,'$.reserved_cash_minor'))
+                FROM ledger_events e WHERE e.aggregate_id=NEW.aggregate_id
+                AND e.event_type='RISK_RELEASED'),0) >
+                (SELECT reserved_cash_minor FROM risk_reservations WHERE client_order_id=NEW.aggregate_id)
+            OR json_extract(NEW.payload_json,'$.reserved_exposure_minor')
+              + COALESCE((SELECT SUM(json_extract(e.payload_json,'$.reserved_exposure_minor'))
+                FROM ledger_events e WHERE e.aggregate_id=NEW.aggregate_id
+                AND e.event_type='RISK_RELEASED'),0) >
+                (SELECT reserved_exposure_minor FROM risk_reservations WHERE client_order_id=NEW.aggregate_id)
+            OR json_extract(NEW.payload_json,'$.reserved_sell_quantity')
+              + COALESCE((SELECT SUM(json_extract(e.payload_json,'$.reserved_sell_quantity'))
+                FROM ledger_events e WHERE e.aggregate_id=NEW.aggregate_id
+                AND e.event_type='RISK_RELEASED'),0) >
+                (SELECT reserved_sell_quantity FROM risk_reservations WHERE client_order_id=NEW.aggregate_id)
+            OR NOT EXISTS (SELECT 1 FROM risk_reservations r
+              WHERE r.client_order_id=NEW.aggregate_id
+                AND r.reserved_cash_minor=json_extract(NEW.payload_json,'$.reserved_cash_minor')
+                AND r.reserved_exposure_minor=json_extract(NEW.payload_json,'$.reserved_exposure_minor')
+                AND r.reserved_sell_quantity=json_extract(NEW.payload_json,'$.reserved_sell_quantity'))
+            OR NOT EXISTS (SELECT 1 FROM ledger_events terminal
+              WHERE terminal.aggregate_id=NEW.aggregate_id AND terminal.sequence=(
+                SELECT MAX(prior.sequence) FROM ledger_events prior
+                WHERE prior.aggregate_id=NEW.aggregate_id)
+              AND (terminal.event_type='SUBMISSION_REJECTED'
+                OR (terminal.event_type='SUBMITTED_UNKNOWN_RESOLVED'
+                  AND json_extract(terminal.payload_json,'$.result')='CONFIRMED_ABSENT'))))
+          THEN RAISE(ABORT, 'risk release exceeds reservation') END;
+        END""",
+)
+
+V10_RESOLUTION_SQL = """CREATE TRIGGER unknown_resolution_contract
+    AFTER INSERT ON ledger_events
+    WHEN NEW.event_type = 'SUBMITTED_UNKNOWN_RESOLVED'
+    BEGIN
+      SELECT CASE WHEN trim(NEW.event_id) = ''
+        OR substr(NEW.occurred_at, -6) != '+00:00'
+        OR julianday(NEW.occurred_at) IS NULL
+        OR json_type(NEW.payload_json, '$.operator_command_id') IS NOT 'text'
+        OR trim(json_extract(NEW.payload_json, '$.operator_command_id')) = ''
+        OR json_type(NEW.payload_json, '$.result') IS NOT 'text'
+        OR json_extract(NEW.payload_json, '$.result') NOT IN
+          ('BROKER_ORDER_LINKED','CONFIRMED_ABSENT','MANUAL_ACTIVITY_LINKED')
+        OR (SELECT COUNT(*) FROM json_each(NEW.payload_json)) != CASE
+          WHEN json_extract(NEW.payload_json, '$.result')='CONFIRMED_ABSENT' THEN 3
+          ELSE 5 END
+        OR (SELECT COUNT(DISTINCT key) FROM json_each(NEW.payload_json)) != CASE
+          WHEN json_extract(NEW.payload_json, '$.result')='CONFIRMED_ABSENT' THEN 3
+          ELSE 5 END
+        OR EXISTS (SELECT 1 FROM json_each(NEW.payload_json) WHERE key NOT IN
+          ('operator_command_id','result','query','broker_order_ref',
+           'source_api_id','manual_activity'))
+        OR json_type(NEW.payload_json, '$.query') IS NOT 'object'
+        OR (SELECT COUNT(*) FROM json_each(NEW.payload_json, '$.query')) != 15
+        OR (SELECT COUNT(DISTINCT key) FROM json_each(NEW.payload_json, '$.query')) != 15
+        OR EXISTS (SELECT 1 FROM json_each(NEW.payload_json, '$.query') WHERE key NOT IN
+          ('environment','account_id','business_date','window_started_at','window_completed_at',
+           'query_policy_version','required_source_capabilities','queried_api_ids',
+           'pagination_complete','observation_ids','response_sha256','candidate_set_sha256',
+           'candidate_count','candidates','fetched_at'))
+        OR json_extract(NEW.payload_json, '$.query.environment') NOT IN
+          ('SIMULATED','PAPER','LIVE')
+        OR json_type(NEW.payload_json, '$.query.account_id') IS NOT 'text'
+        OR trim(json_extract(NEW.payload_json, '$.query.account_id')) = ''
+        OR (length(json_extract(NEW.payload_json, '$.query.account_id')) BETWEEN 8 AND 14
+          AND replace(json_extract(NEW.payload_json, '$.query.account_id'),'-','')
+            NOT GLOB '*[^0-9]*'
+          AND length(replace(json_extract(NEW.payload_json, '$.query.account_id'),'-','')) >= 8)
+        OR json_type(NEW.payload_json, '$.query.business_date') IS NOT 'text'
+        OR length(json_extract(NEW.payload_json, '$.query.business_date')) != 10
+        OR date(json_extract(NEW.payload_json, '$.query.business_date')) IS NULL
+        OR json_type(NEW.payload_json, '$.query.query_policy_version') IS NOT 'text'
+        OR json_extract(NEW.payload_json, '$.query.query_policy_version') IS NOT
+          'unknown-resolution-v1'
+        OR json_type(NEW.payload_json, '$.query.window_started_at') IS NOT 'text'
+        OR json_type(NEW.payload_json, '$.query.window_completed_at') IS NOT 'text'
+        OR json_type(NEW.payload_json, '$.query.fetched_at') IS NOT 'text'
+        OR substr(json_extract(NEW.payload_json, '$.query.window_started_at'),-6)!='+00:00'
+        OR substr(json_extract(NEW.payload_json, '$.query.window_completed_at'),-6)!='+00:00'
+        OR substr(json_extract(NEW.payload_json, '$.query.fetched_at'),-6)!='+00:00'
+        OR julianday(json_extract(NEW.payload_json, '$.query.window_started_at')) IS NULL
+        OR julianday(json_extract(NEW.payload_json, '$.query.window_completed_at')) IS NULL
+        OR julianday(json_extract(NEW.payload_json, '$.query.fetched_at')) IS NULL
+        OR julianday(json_extract(NEW.payload_json, '$.query.window_started_at')) >
+          julianday(json_extract(NEW.payload_json, '$.query.window_completed_at'))
+        OR julianday(json_extract(NEW.payload_json, '$.query.window_completed_at')) >
+          julianday(json_extract(NEW.payload_json, '$.query.fetched_at'))
+        OR julianday(json_extract(NEW.payload_json, '$.query.fetched_at')) > julianday(NEW.occurred_at)
+        OR json_type(NEW.payload_json, '$.query.pagination_complete') IS NOT 'true'
+        OR json_type(NEW.payload_json, '$.query.candidate_count') IS NOT 'integer'
+        OR json_extract(NEW.payload_json, '$.query.candidate_count') != CASE
+          WHEN json_extract(NEW.payload_json, '$.result')='CONFIRMED_ABSENT' THEN 0 ELSE 1 END
+        OR json_type(NEW.payload_json, '$.query.queried_api_ids') IS NOT 'array'
+        OR json_type(NEW.payload_json, '$.query.required_source_capabilities') IS NOT 'array'
+        OR json_extract(NEW.payload_json, '$.query.required_source_capabilities') IS NOT
+          json_array('broker.orders.read')
+        OR json_extract(NEW.payload_json, '$.query.required_source_capabilities') IS NOT
+          json_extract(NEW.payload_json, '$.query.queried_api_ids')
+        OR json_array_length(NEW.payload_json, '$.query.queried_api_ids') < 1
+        OR EXISTS (SELECT 1 FROM json_each(NEW.payload_json, '$.query.queried_api_ids')
+          WHERE type IS NOT 'text' OR trim(value)='')
+        OR (SELECT COUNT(*) FROM json_each(NEW.payload_json, '$.query.queried_api_ids')) !=
+          (SELECT COUNT(DISTINCT value) FROM json_each(NEW.payload_json, '$.query.queried_api_ids'))
+        OR json_type(NEW.payload_json, '$.query.observation_ids') IS NOT 'array'
+        OR json_array_length(NEW.payload_json, '$.query.observation_ids') < 1
+        OR EXISTS (SELECT 1 FROM json_each(NEW.payload_json, '$.query.observation_ids')
+          WHERE type IS NOT 'text' OR trim(value)='')
+        OR (SELECT COUNT(*) FROM json_each(NEW.payload_json, '$.query.observation_ids')) !=
+          (SELECT COUNT(DISTINCT value) FROM json_each(NEW.payload_json, '$.query.observation_ids'))
+        OR json_type(NEW.payload_json, '$.query.response_sha256') IS NOT 'text'
+        OR length(json_extract(NEW.payload_json, '$.query.response_sha256')) != 64
+        OR json_extract(NEW.payload_json, '$.query.response_sha256') GLOB '*[^0-9a-f]*'
+        OR json_type(NEW.payload_json, '$.query.candidate_set_sha256') IS NOT 'text'
+        OR length(json_extract(NEW.payload_json, '$.query.candidate_set_sha256')) != 64
+        OR json_extract(NEW.payload_json, '$.query.candidate_set_sha256') GLOB '*[^0-9a-f]*'
+        OR json_type(NEW.payload_json, '$.query.candidates') IS NOT 'array'
+        OR json_array_length(NEW.payload_json, '$.query.candidates') IS NOT
+          json_extract(NEW.payload_json, '$.query.candidate_count')
+        OR EXISTS (SELECT 1 FROM json_each(NEW.payload_json, '$.query.candidates') candidate
+          WHERE candidate.type IS NOT 'object'
+            OR (SELECT COUNT(*) FROM json_each(candidate.value)) != 4
+            OR (SELECT COUNT(DISTINCT key) FROM json_each(candidate.value)) != 4
+            OR EXISTS (SELECT 1 FROM json_each(candidate.value) WHERE key NOT IN
+              ('environment','account_id','business_date','broker_order_id'))
+            OR json_extract(candidate.value, '$.environment') IS NOT
+              json_extract(NEW.payload_json, '$.query.environment')
+            OR json_extract(candidate.value, '$.account_id') IS NOT
+              json_extract(NEW.payload_json, '$.query.account_id')
+            OR json_extract(candidate.value, '$.business_date') IS NOT
+              json_extract(NEW.payload_json, '$.query.business_date')
+            OR json_type(candidate.value, '$.broker_order_id') IS NOT 'text'
+            OR trim(json_extract(candidate.value, '$.broker_order_id'))='')
+      THEN RAISE(ABORT, 'invalid typed unknown resolution evidence') END;
+      SELECT CASE WHEN json_extract(NEW.payload_json, '$.result')='BROKER_ORDER_LINKED' AND (
+          json_type(NEW.payload_json, '$.source_api_id') IS NOT 'text'
+          OR NOT EXISTS (SELECT 1 FROM json_each(NEW.payload_json, '$.query.queried_api_ids')
+            WHERE value=json_extract(NEW.payload_json, '$.source_api_id'))
+          OR json_type(NEW.payload_json, '$.manual_activity') IS NOT NULL)
+        OR json_extract(NEW.payload_json, '$.result')='CONFIRMED_ABSENT' AND (
+          json_type(NEW.payload_json, '$.broker_order_ref') IS NOT NULL
+          OR json_type(NEW.payload_json, '$.source_api_id') IS NOT NULL
+          OR json_type(NEW.payload_json, '$.manual_activity') IS NOT NULL)
+        OR json_extract(NEW.payload_json, '$.result')='MANUAL_ACTIVITY_LINKED' AND (
+          json_type(NEW.payload_json, '$.source_api_id') IS NOT NULL
+          OR json_type(NEW.payload_json, '$.manual_activity') IS NOT 'object'
+          OR (SELECT COUNT(*) FROM json_each(NEW.payload_json, '$.manual_activity')) != 3
+          OR (SELECT COUNT(DISTINCT key) FROM json_each(
+               NEW.payload_json, '$.manual_activity')) != 3
+          OR EXISTS (SELECT 1 FROM json_each(NEW.payload_json, '$.manual_activity')
+            WHERE key NOT IN ('reference','actor','observed_at'))
+          OR json_type(NEW.payload_json, '$.manual_activity.reference') IS NOT 'text'
+          OR trim(json_extract(NEW.payload_json, '$.manual_activity.reference'))=''
+          OR json_type(NEW.payload_json, '$.manual_activity.actor') IS NOT 'text'
+          OR trim(json_extract(NEW.payload_json, '$.manual_activity.actor'))=''
+          OR json_type(NEW.payload_json, '$.manual_activity.observed_at') IS NOT 'text'
+          OR substr(json_extract(NEW.payload_json, '$.manual_activity.observed_at'),-6)!='+00:00'
+          OR julianday(json_extract(NEW.payload_json, '$.manual_activity.observed_at')) IS NULL
+          OR julianday(json_extract(NEW.payload_json, '$.manual_activity.observed_at')) >
+             julianday(json_extract(NEW.payload_json, '$.query.fetched_at')))
+      THEN RAISE(ABORT, 'invalid unknown resolution variant') END;
+      SELECT CASE WHEN json_extract(NEW.payload_json, '$.result')!='CONFIRMED_ABSENT' AND (
+          json_type(NEW.payload_json, '$.broker_order_ref') IS NOT 'object'
+          OR (SELECT COUNT(*) FROM json_each(NEW.payload_json, '$.broker_order_ref')) != 4
+          OR (SELECT COUNT(DISTINCT key) FROM json_each(
+               NEW.payload_json, '$.broker_order_ref')) != 4
+          OR EXISTS (SELECT 1 FROM json_each(NEW.payload_json, '$.broker_order_ref')
+            WHERE key NOT IN ('environment','account_id','business_date','broker_order_id'))
+          OR json_extract(NEW.payload_json, '$.broker_order_ref.environment') IS NOT
+             json_extract(NEW.payload_json, '$.query.environment')
+          OR json_extract(NEW.payload_json, '$.broker_order_ref.account_id') IS NOT
+             json_extract(NEW.payload_json, '$.query.account_id')
+          OR json_extract(NEW.payload_json, '$.broker_order_ref.business_date') IS NOT
+             json_extract(NEW.payload_json, '$.query.business_date')
+          OR date(json_extract(NEW.payload_json, '$.broker_order_ref.business_date')) <
+             date(json_extract(NEW.payload_json, '$.query.window_started_at'))
+          OR date(json_extract(NEW.payload_json, '$.broker_order_ref.business_date')) >
+             date(json_extract(NEW.payload_json, '$.query.window_completed_at'))
+          OR json_type(NEW.payload_json, '$.broker_order_ref.business_date') IS NOT 'text'
+          OR length(json_extract(NEW.payload_json, '$.broker_order_ref.business_date')) != 10
+          OR date(json_extract(NEW.payload_json, '$.broker_order_ref.business_date')) IS NULL
+          OR json_type(NEW.payload_json, '$.broker_order_ref.broker_order_id') IS NOT 'text'
+          OR trim(json_extract(NEW.payload_json, '$.broker_order_ref.broker_order_id'))=''
+          OR NOT EXISTS (SELECT 1 FROM json_each(NEW.payload_json, '$.query.candidates') candidate
+            WHERE json_extract(candidate.value, '$.environment') IS
+                json_extract(NEW.payload_json, '$.broker_order_ref.environment')
+              AND json_extract(candidate.value, '$.account_id') IS
+                json_extract(NEW.payload_json, '$.broker_order_ref.account_id')
+              AND json_extract(candidate.value, '$.business_date') IS
+                json_extract(NEW.payload_json, '$.broker_order_ref.business_date')
+              AND json_extract(candidate.value, '$.broker_order_id') IS
+                json_extract(NEW.payload_json, '$.broker_order_ref.broker_order_id')))
+      THEN RAISE(ABORT, 'invalid broker order reference') END;
+      SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM order_requests AS reserved
+        JOIN operator_commands AS command
+          ON command.command_id=json_extract(NEW.payload_json, '$.operator_command_id')
+        WHERE reserved.client_order_id=NEW.aggregate_id
+          AND json_extract(command.canonical_json, '$.action')='RESOLVE_SUBMITTED_UNKNOWN'
+          AND json_extract(command.canonical_json, '$.client_order_id')=NEW.aggregate_id
+          AND json_extract(command.canonical_json, '$.account_id')=
+              json_extract(reserved.canonical_json, '$.request.account_id')
+          AND json_extract(command.canonical_json, '$.account_id')=
+              json_extract(NEW.payload_json, '$.query.account_id')
+          AND json_extract(command.canonical_json, '$.environment')=
+              json_extract(reserved.canonical_json, '$.environment')
+          AND json_extract(command.canonical_json, '$.environment')=
+              json_extract(NEW.payload_json, '$.query.environment'))
+        OR NOT EXISTS (SELECT 1 FROM ledger_events requested
+          WHERE requested.aggregate_id=json_extract(NEW.payload_json, '$.operator_command_id')
+            AND requested.event_type='OPERATOR_COMMAND_REQUESTED' AND requested.sequence<NEW.sequence)
+        OR EXISTS (SELECT 1 FROM ledger_events terminal
+          WHERE terminal.aggregate_id=json_extract(NEW.payload_json, '$.operator_command_id')
+            AND terminal.event_type IN ('OPERATOR_COMMAND_SUCCEEDED','OPERATOR_COMMAND_FAILED')
+            AND terminal.sequence<NEW.sequence)
+        OR NOT EXISTS (SELECT 1 FROM ledger_events unknown_event
+          WHERE unknown_event.aggregate_id=NEW.aggregate_id
+            AND unknown_event.event_type='SUBMITTED_UNKNOWN' AND unknown_event.sequence<NEW.sequence
+            AND unknown_event.sequence>COALESCE((SELECT MAX(prior.sequence)
+              FROM ledger_events prior WHERE prior.aggregate_id=NEW.aggregate_id
+                AND prior.event_type='SUBMITTED_UNKNOWN_RESOLVED'
+                AND prior.sequence<NEW.sequence),0))
+      THEN RAISE(ABORT, 'invalid unknown resolution audit chain') END;
+    END"""
+V10_STATEMENTS = ("DROP TRIGGER unknown_resolution_contract", V10_RESOLUTION_SQL)
 
 
 class SQLiteLedger:
@@ -490,6 +899,9 @@ class SQLiteLedger:
             4: V3_OBJECTS,
             5: V6_OBJECTS,
             6: V6_OBJECTS,
+            7: V7_OBJECTS,
+            8: V8_OBJECTS,
+            9: V9_OBJECTS,
             SCHEMA_VERSION: CURRENT_OBJECTS,
         }[version]
         if cls._objects(connection) != expected_objects:
@@ -498,6 +910,8 @@ class SQLiteLedger:
             tables = ("ledger_events", "order_requests")
         elif version < 5:
             tables = ("ledger_events", "order_requests", "operator_commands")
+        elif version < 9:
+            tables = tuple(name for name in TABLE_COLUMNS if name != "risk_reservations")
         else:
             tables = tuple(TABLE_COLUMNS)
         for table in tables:
@@ -564,6 +978,23 @@ class SQLiteLedger:
                     "operator_terminal_contract": V7_STATEMENTS[3],
                 }
             )
+        if version >= 8:
+            expected_sql.update(
+                {
+                    "order_environment_contract": V8_STATEMENTS[0],
+                    "operator_environment_contract": V8_STATEMENTS[1],
+                }
+            )
+        if version >= 9:
+            expected_sql.update({
+                "risk_reservations": V9_STATEMENTS[0],
+                "risk_reservations_no_update": V9_STATEMENTS[1],
+                "risk_reservations_no_delete": V9_STATEMENTS[2],
+                "risk_reserved_once": V9_STATEMENTS[3],
+                "risk_event_contract": V9_STATEMENTS[4],
+            })
+        if version >= 10:
+            expected_sql["unknown_resolution_contract"] = V10_RESOLUTION_SQL
         actual_sql = {
             row[0]: cls._normalize_sql(row[1])
             for row in connection.execute(
@@ -592,6 +1023,33 @@ class SQLiteLedger:
         return json.loads(value, object_pairs_hook=reject_duplicates)
 
     @staticmethod
+    def _validate_submission_states(connection: sqlite3.Connection) -> None:
+        order_ids = {
+            row[0] for row in connection.execute(
+                "SELECT client_order_id FROM order_requests"
+            )
+        }
+        submission_states: dict[str, str] = {}
+        for event_type, aggregate_id in connection.execute(
+            """SELECT event_type, aggregate_id FROM ledger_events ORDER BY sequence"""
+        ):
+            previous_submission_state = submission_states.get(aggregate_id)
+            if event_type == "PREPARED":
+                if aggregate_id not in order_ids or previous_submission_state is not None:
+                    raise SchemaError("invalid historical PREPARED transition")
+                submission_states[aggregate_id] = event_type
+            elif event_type == "SUBMISSION_STARTED":
+                if previous_submission_state != "PREPARED":
+                    raise SchemaError("invalid historical SUBMISSION_STARTED transition")
+                submission_states[aggregate_id] = event_type
+            elif event_type in {
+                "ACKNOWLEDGED", "SUBMISSION_REJECTED", "SUBMITTED_UNKNOWN",
+            }:
+                if previous_submission_state != "SUBMISSION_STARTED":
+                    raise SchemaError("invalid historical submission terminal transition")
+                submission_states[aggregate_id] = event_type
+
+    @staticmethod
     def _validate_audit_semantics(connection: sqlite3.Connection, *, version: int) -> None:
         try:
             if version >= 5:
@@ -601,11 +1059,30 @@ class SQLiteLedger:
                 expected_metadata = {"terminal_payload_v5_cutoff"}
                 if version >= 7:
                     expected_metadata.add("operator_binding_v7_cutoff")
+                if version >= 8:
+                    expected_metadata.update({
+                        "order_environment_v8_cutoff",
+                        "operator_environment_v8_cutoff",
+                    })
+                if version >= 9:
+                    expected_metadata.add("risk_reservation_v9_order_cutoff")
+                if version >= 10:
+                    expected_metadata.add("typed_resolution_v10_cutoff")
                 metadata_map = dict(metadata)
                 if len(metadata) != len(expected_metadata) or set(metadata_map) != expected_metadata:
                     raise SchemaError("schema metadata contract is malformed")
                 terminal_v5_cutoff = int(metadata_map["terminal_payload_v5_cutoff"])
                 operator_v7_cutoff = int(metadata_map.get("operator_binding_v7_cutoff", "0"))
+                order_v8_cutoff = int(metadata_map.get("order_environment_v8_cutoff", "0"))
+                command_v8_cutoff = int(
+                    metadata_map.get("operator_environment_v8_cutoff", "0")
+                )
+                reservation_v9_cutoff = int(
+                    metadata_map.get("risk_reservation_v9_order_cutoff", "0")
+                )
+                typed_resolution_v10_cutoff = int(
+                    metadata_map.get("typed_resolution_v10_cutoff", "0")
+                )
                 if terminal_v5_cutoff < 0:
                     raise SchemaError("terminal payload cutoff cannot be negative")
                 highest_sequence = int(connection.execute(
@@ -615,16 +1092,38 @@ class SQLiteLedger:
                     raise SchemaError("terminal payload cutoff exceeds ledger history")
                 if operator_v7_cutoff < 0 or operator_v7_cutoff > highest_sequence:
                     raise SchemaError("operator binding cutoff is outside ledger history")
+                highest_order_rowid = int(connection.execute(
+                    "SELECT COALESCE(MAX(rowid), 0) FROM order_requests"
+                ).fetchone()[0])
+                highest_command_rowid = int(connection.execute(
+                    "SELECT COALESCE(MAX(rowid), 0) FROM operator_commands"
+                ).fetchone()[0])
+                if not 0 <= order_v8_cutoff <= highest_order_rowid:
+                    raise SchemaError("order environment cutoff is outside history")
+                if not 0 <= command_v8_cutoff <= highest_command_rowid:
+                    raise SchemaError("operator environment cutoff is outside history")
+                if not 0 <= reservation_v9_cutoff <= highest_order_rowid:
+                    raise SchemaError("risk reservation cutoff is outside history")
+                if not 0 <= typed_resolution_v10_cutoff <= highest_sequence:
+                    raise SchemaError("typed resolution cutoff is outside history")
             else:
                 terminal_v5_cutoff = int(connection.execute(
                     "SELECT COALESCE(MAX(sequence), 0) FROM ledger_events"
                 ).fetchone()[0])
                 operator_v7_cutoff = 0
+                order_v8_cutoff = 0
+                command_v8_cutoff = 0
+                reservation_v9_cutoff = 0
+                typed_resolution_v10_cutoff = 0
+            if version < 10:
+                typed_resolution_v10_cutoff = int(connection.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) FROM ledger_events"
+                ).fetchone()[0])
             command_rows = connection.execute(
-                "SELECT command_id, canonical_json FROM operator_commands"
+                "SELECT rowid, command_id, canonical_json FROM operator_commands"
             ).fetchall()
             commands: dict[str, tuple[OperatorCommand, dict[str, object]]] = {}
-            for command_id, canonical_json in command_rows:
+            for rowid, command_id, canonical_json in command_rows:
                 canonical = SQLiteLedger._strict_json(canonical_json)
                 legacy_command_keys = {
                     "command_id", "actor", "reason", "deployment_version",
@@ -634,12 +1133,18 @@ class SQLiteLedger:
                 current_command_keys = legacy_command_keys | {
                     "client_order_id", "risk_decision_id", "execution_plan_id",
                 }
+                environment_command_keys = current_command_keys | {"environment"}
                 legacy_command = frozenset(canonical) == frozenset(legacy_command_keys)
                 if (
                     frozenset(canonical) not in {
                         frozenset(legacy_command_keys), frozenset(current_command_keys),
+                        frozenset(environment_command_keys),
                     }
                     or canonical["command_id"] != command_id
+                    or (
+                        version >= 8
+                        and ((rowid > command_v8_cutoff) != ("environment" in canonical))
+                    )
                 ):
                     raise SchemaError("operator command canonical payload is malformed")
                 parsed = OperatorCommand(
@@ -652,6 +1157,9 @@ class SQLiteLedger:
                     expires_at=datetime.fromisoformat(canonical["expires_at"]),
                     action=OperatorAction(canonical["action"]),
                     account_id=canonical["account_id"] or "LEGACY_GLOBAL",
+                    environment=TradingEnvironment(
+                        canonical.get("environment", TradingEnvironment.SIMULATED)
+                    ),
                     client_order_id=(
                         "LEGACY_UNBOUND"
                         if legacy_command
@@ -701,11 +1209,60 @@ class SQLiteLedger:
                         raise SchemaError("current operator command requires an account alias")
 
             order_rows = {
-                row[0]: SQLiteLedger._strict_json(row[1])
+                row[1]: SQLiteLedger._strict_json(row[2])
                 for row in connection.execute(
-                    "SELECT client_order_id, canonical_json FROM order_requests"
+                    "SELECT rowid, client_order_id, canonical_json FROM order_requests"
                 )
             }
+            if version >= 8:
+                for rowid, client_order_id, canonical_json in connection.execute(
+                    "SELECT rowid, client_order_id, canonical_json FROM order_requests"
+                ):
+                    canonical = SQLiteLedger._strict_json(canonical_json)
+                    if rowid <= order_v8_cutoff:
+                        if "environment" in canonical:
+                            raise SchemaError("order environment payload crosses v8 cutoff")
+                        continue
+                    environment = canonical.get("environment")
+                    permit = canonical.get("permit")
+                    risk = canonical.get("risk")
+                    plan = canonical.get("plan")
+                    market = plan.get("market_evidence") if isinstance(plan, dict) else None
+                    if (
+                        environment not in {item.value for item in TradingEnvironment}
+                        or not isinstance(permit, dict)
+                        or permit.get("environment") != environment
+                        or not isinstance(permit.get("permit_id"), str)
+                        or not permit["permit_id"].strip()
+                        or not isinstance(risk, dict)
+                        or risk.get("input_snapshot_environment") != environment
+                        or not isinstance(market, dict)
+                        or market.get("environment") != environment
+                        or market.get("pricing_policy_version")
+                        != plan.get("pricing_policy_version")
+                        or plan.get("pricing_policy_version") != risk.get("policy_version")
+                        or risk.get("policy_version") != permit.get("policy_version")
+                        or not isinstance(market.get("snapshot_id"), str)
+                        or not market["snapshot_id"].strip()
+                        or market.get("snapshot_id") != permit.get("market_snapshot_id")
+                        or market.get("quality") != "CONSISTENT"
+                        or market.get("minimum_limit_price")
+                        != plan.get("minimum_limit_price")
+                        or market.get("maximum_limit_price")
+                        != plan.get("maximum_limit_price")
+                    ):
+                        raise SchemaError("order environment payload is malformed")
+                    minimum = Decimal(market["minimum_limit_price"])
+                    maximum = Decimal(market["maximum_limit_price"])
+                    observed_at = datetime.fromisoformat(market["observed_at"])
+                    require_utc(observed_at, "order market evidence observed_at")
+                    if (
+                        not minimum.is_finite()
+                        or not maximum.is_finite()
+                        or minimum <= 0
+                        or maximum < minimum
+                    ):
+                        raise SchemaError("order market evidence band is malformed")
             duplicate_permit = connection.execute(
                 """SELECT json_extract(canonical_json, '$.permit.permit_id')
                    FROM order_requests
@@ -715,26 +1272,11 @@ class SQLiteLedger:
             ).fetchone()
             if duplicate_permit is not None:
                 raise SchemaError("permit is consumed by multiple order requests")
-            submission_states: dict[str, str] = {}
+            SQLiteLedger._validate_submission_states(connection)
             last_unknown: dict[str, int] = {}
             last_resolution: dict[str, int] = {}
             resolutions_by_command: dict[str, str] = {}
             for sequence, event_id, event_type, aggregate_id, occurred_at, payload_json in rows:
-                previous_submission_state = submission_states.get(aggregate_id)
-                if event_type == "PREPARED":
-                    if aggregate_id not in order_rows or previous_submission_state is not None:
-                        raise SchemaError("invalid historical PREPARED transition")
-                    submission_states[aggregate_id] = event_type
-                elif event_type == "SUBMISSION_STARTED":
-                    if previous_submission_state != "PREPARED":
-                        raise SchemaError("invalid historical SUBMISSION_STARTED transition")
-                    submission_states[aggregate_id] = event_type
-                elif event_type in {
-                    "ACKNOWLEDGED", "SUBMISSION_REJECTED", "SUBMITTED_UNKNOWN",
-                }:
-                    if previous_submission_state != "SUBMISSION_STARTED":
-                        raise SchemaError("invalid historical submission terminal transition")
-                    submission_states[aggregate_id] = event_type
                 if event_type == "SUBMITTED_UNKNOWN":
                     last_unknown[aggregate_id] = sequence
                     continue
@@ -824,21 +1366,25 @@ class SQLiteLedger:
                 require_id(event_id, "unknown resolution event_id")
                 require_utc(datetime.fromisoformat(occurred_at), "unknown resolution time")
                 payload = SQLiteLedger._strict_json(payload_json)
-                if set(payload) != {
-                    "operator_command_id", "result", "observation", "reference", "observed_at",
-                }:
-                    raise SchemaError("unknown resolution payload keys are malformed")
-                evidence = UnknownResolutionEvidence(
-                    result=UnknownResolutionResult(payload["result"]),
-                    observation=payload["observation"],
-                    reference=payload["reference"],
-                    observed_at=datetime.fromisoformat(payload["observed_at"]),
-                )
                 resolution_time = datetime.fromisoformat(occurred_at)
-                if evidence.observed_at > resolution_time:
-                    raise SchemaError("unknown resolution evidence is from the future")
-                if evidence.result.value != payload["result"]:
-                    raise SchemaError("unknown resolution result is malformed")
+                if sequence <= typed_resolution_v10_cutoff:
+                    if set(payload) != {
+                        "operator_command_id", "result", "observation", "reference",
+                        "observed_at",
+                    } or payload["result"] not in {
+                        "BROKER_ORDER_LINKED", "CONFIRMED_ABSENT", "MANUAL_ACTIVITY_LINKED",
+                    }:
+                        raise SchemaError("legacy unknown resolution payload is malformed")
+                    for key in ("operator_command_id", "observation", "reference"):
+                        require_id(payload[key], key)
+                    evidence_time = datetime.fromisoformat(payload["observed_at"])
+                    require_utc(evidence_time, "legacy unknown resolution observed_at")
+                    if evidence_time > resolution_time:
+                        raise SchemaError("unknown resolution evidence is from the future")
+                else:
+                    evidence = resolution_from_payload(payload)
+                    if evidence.evidence.fetched_at > resolution_time:
+                        raise SchemaError("unknown resolution evidence is from the future")
                 command_id = payload["operator_command_id"]
                 command_entry = commands.get(command_id)
                 order = order_rows.get(aggregate_id)
@@ -846,10 +1392,19 @@ class SQLiteLedger:
                     order_account = order["request"]["account_id"]
                 except (KeyError, TypeError):
                     raise SchemaError("resolved order has no internal account alias") from None
+                order_environment = order.get("environment")
                 if (
                     command_entry is None
                     or command_entry[0].action is not OperatorAction.RESOLVE_SUBMITTED_UNKNOWN
                     or command_entry[0].account_id != order_account
+                    or (
+                        sequence > typed_resolution_v10_cutoff
+                        and (
+                            evidence.evidence.account_id != order_account
+                            or evidence.evidence.environment is not command_entry[0].environment
+                            or evidence.evidence.environment.value != order_environment
+                        )
+                    )
                     or (
                         "client_order_id" in command_entry[1]
                         and command_entry[0].client_order_id != aggregate_id
@@ -862,9 +1417,35 @@ class SQLiteLedger:
                     raise SchemaError("unknown resolution audit chain is invalid")
                 last_resolution[aggregate_id] = sequence
                 resolutions_by_command[command_id] = aggregate_id
+            if version >= 9:
+                malformed = connection.execute(
+                    """SELECT 1 FROM risk_reservations r
+                       LEFT JOIN order_requests o ON o.client_order_id=r.client_order_id
+                       LEFT JOIN ledger_events e ON e.aggregate_id=r.client_order_id
+                         AND e.event_type='RISK_RESERVED'
+                       GROUP BY r.client_order_id
+                       HAVING o.client_order_id IS NULL OR COUNT(e.sequence) != 1
+                         OR MAX(json_extract(e.payload_json,'$.reserved_cash_minor'))
+                           != r.reserved_cash_minor
+                         OR MAX(json_extract(e.payload_json,'$.reserved_exposure_minor'))
+                           != r.reserved_exposure_minor
+                         OR MAX(json_extract(e.payload_json,'$.reserved_sell_quantity'))
+                           != r.reserved_sell_quantity
+                       LIMIT 1"""
+                ).fetchone()
+                orphan = connection.execute(
+                    """SELECT 1 FROM ledger_events e LEFT JOIN risk_reservations r
+                         ON r.client_order_id=e.aggregate_id
+                       WHERE e.event_type IN ('RISK_RESERVED','RISK_RELEASED')
+                         AND r.client_order_id IS NULL LIMIT 1"""
+                ).fetchone()
+                if malformed is not None or orphan is not None:
+                    raise SchemaError("risk reservation projection is malformed")
         except SchemaError:
             raise
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        except (
+            KeyError, TypeError, ValueError, InvalidOperation, json.JSONDecodeError,
+        ) as error:
             raise SchemaError("audit semantic validation failed") from error
 
     def _initialize(self) -> None:
@@ -872,7 +1453,9 @@ class SQLiteLedger:
             self.connection.execute("BEGIN IMMEDIATE")
             version = self.schema_version
             objects = self._objects(self.connection)
-            if version > SCHEMA_VERSION or version not in {0, 1, 2, 3, 4, 5, 6, 7}:
+            if version > SCHEMA_VERSION or version not in {
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, SCHEMA_VERSION,
+            }:
                 raise SchemaError(f"unsupported schema version {version}")
             if version == SCHEMA_VERSION:
                 self._validate_schema(self.connection, SCHEMA_VERSION)
@@ -881,7 +1464,19 @@ class SQLiteLedger:
                 )
                 self.connection.execute("COMMIT")
                 return
-            if version == 6:
+            if version == 9:
+                self._validate_schema(self.connection, 9)
+                self._validate_audit_semantics(self.connection, version=9)
+                statements = V10_STATEMENTS
+            elif version == 8:
+                self._validate_schema(self.connection, 8)
+                self._validate_audit_semantics(self.connection, version=8)
+                statements = ()
+            elif version == 7:
+                self._validate_schema(self.connection, 7)
+                self._validate_audit_semantics(self.connection, version=7)
+                statements = V8_STATEMENTS
+            elif version == 6:
                 self._validate_schema(self.connection, 6)
                 self._validate_audit_semantics(self.connection, version=6)
                 statements = V7_STATEMENTS
@@ -931,6 +1526,12 @@ class SQLiteLedger:
                     + V5_STATEMENTS
                     + V6_STATEMENTS + V7_STATEMENTS
                 )
+            if version < 7:
+                statements += V8_STATEMENTS
+            if version < 9:
+                statements += V9_STATEMENTS
+            if version < 10 and version != 9:
+                statements += V10_STATEMENTS
             for statement in statements:
                 self.connection.execute(statement)
             if version < 5:
@@ -948,6 +1549,37 @@ class SQLiteLedger:
                 self.connection.execute(
                     "INSERT INTO schema_metadata VALUES ('operator_binding_v7_cutoff', ?)",
                     (str(cutoff),),
+                )
+            if version < 8:
+                order_cutoff = int(self.connection.execute(
+                    "SELECT COALESCE(MAX(rowid), 0) FROM order_requests"
+                ).fetchone()[0])
+                command_cutoff = int(self.connection.execute(
+                    "SELECT COALESCE(MAX(rowid), 0) FROM operator_commands"
+                ).fetchone()[0])
+                self.connection.execute(
+                    "INSERT INTO schema_metadata VALUES ('order_environment_v8_cutoff', ?)",
+                    (str(order_cutoff),),
+                )
+                self.connection.execute(
+                    "INSERT INTO schema_metadata VALUES ('operator_environment_v8_cutoff', ?)",
+                    (str(command_cutoff),),
+                )
+            if version < 9:
+                reservation_cutoff = int(self.connection.execute(
+                    "SELECT COALESCE(MAX(rowid), 0) FROM order_requests"
+                ).fetchone()[0])
+                self.connection.execute(
+                    "INSERT INTO schema_metadata VALUES ('risk_reservation_v9_order_cutoff', ?)",
+                    (str(reservation_cutoff),),
+                )
+            if version < 10:
+                resolution_cutoff = int(self.connection.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) FROM ledger_events"
+                ).fetchone()[0])
+                self.connection.execute(
+                    "INSERT INTO schema_metadata VALUES ('typed_resolution_v10_cutoff', ?)",
+                    (str(resolution_cutoff),),
                 )
             self._validate_schema(self.connection, SCHEMA_VERSION)
             self._validate_audit_semantics(self.connection, version=SCHEMA_VERSION)
@@ -971,8 +1603,42 @@ class SQLiteLedger:
                VALUES (?, ?, ?, ?, ?, ?)""",
             (
                 event.event_id, event.event_type, event.aggregate_id, event.occurred_at.isoformat(),
-                recorded_at, self._json(event.payload),
+                recorded_at, self._json(
+                    event.payload,
+                    canonical=event.event_type == "SUBMITTED_UNKNOWN_RESOLVED",
+                ),
             ),
+        )
+
+    @staticmethod
+    def _risk_payload(terms: ReservationTerms) -> dict[str, int]:
+        return {
+            "reserved_cash_minor": terms.reserved_cash_minor,
+            "reserved_exposure_minor": terms.reserved_exposure_minor,
+            "reserved_sell_quantity": terms.reserved_sell_quantity,
+        }
+
+    def _insert_full_release(
+        self, client_order_id: str, event_id: str, occurred_at: datetime, recorded_at: str,
+    ) -> None:
+        row = self.connection.execute(
+            """SELECT reserved_cash_minor, reserved_exposure_minor,
+                      reserved_sell_quantity FROM risk_reservations
+               WHERE client_order_id=?""",
+            (client_order_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("submission has no risk reservation")
+        self._insert_event(
+            LedgerEvent(
+                event_id, "RISK_RELEASED", client_order_id, occurred_at,
+                {
+                    "reserved_cash_minor": row[0],
+                    "reserved_exposure_minor": row[1],
+                    "reserved_sell_quantity": row[2],
+                },
+            ),
+            recorded_at,
         )
 
     def reserve_submission(
@@ -981,7 +1647,8 @@ class SQLiteLedger:
         canonical_payload: Mapping[str, object],
         prepared_event: LedgerEvent,
         started_event: LedgerEvent,
-        permit_id: str | None,
+        permit_id: str,
+        reservation_terms: ReservationTerms,
     ) -> bool:
         require_id(client_order_id, "client_order_id")
         require_id(prepared_event.event_id, "prepared_event.event_id")
@@ -996,16 +1663,35 @@ class SQLiteLedger:
         require_utc(prepared_event.occurred_at, "occurred_at")
         require_utc(started_event.occurred_at, "occurred_at")
         permit = canonical_payload.get("permit")
-        if permit is None:
-            canonical_permit_id = None
-        elif isinstance(permit, Mapping):
+        if isinstance(permit, Mapping):
             canonical_permit_id = permit.get("permit_id")
         else:
-            raise ValueError("canonical permit must be an object or null")
-        if permit_id is not None:
-            require_id(permit_id, "permit_id")
+            raise ValueError("canonical permit must be an object")
+        require_id(permit_id, "permit_id")
         if canonical_permit_id != permit_id:
             raise ValueError("permit_id does not match the immutable order payload")
+        if type(reservation_terms) is not ReservationTerms:
+            raise ValueError("exact ReservationTerms are required")
+        ReservationTerms.__post_init__(reservation_terms)
+        try:
+            request = canonical_payload["request"]
+            risk = canonical_payload["risk"]
+            if (
+                request["account_id"] != reservation_terms.account_id
+                or request["instrument"] != {
+                    "market": reservation_terms.instrument.market,
+                    "symbol": reservation_terms.instrument.symbol,
+                    "currency": reservation_terms.instrument.currency,
+                }
+                or request["side"] != reservation_terms.side.value
+                or int(request["quantity"]) != reservation_terms.quantity
+                or risk["input_snapshot_id"] != reservation_terms.account_snapshot_id
+                or risk["policy_version"] != reservation_terms.policy_version
+                or canonical_payload["environment"] != reservation_terms.environment.value
+            ):
+                raise ValueError("reservation terms do not match immutable order payload")
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("reservation terms do not match immutable order payload") from error
         canonical = self._json(canonical_payload, canonical=True)
         recorded_at = datetime.now(timezone.utc).isoformat()
         try:
@@ -1017,15 +1703,136 @@ class SQLiteLedger:
             if existing is not None:
                 if existing[0] != canonical:
                     raise OrderReservationConflict("client_order_id has different immutable payload")
+                existing_terms = self.connection.execute(
+                    """SELECT account_id, account_snapshot_id, environment, policy_version,
+                              market, symbol, account_currency, instrument_currency, side,
+                              quantity, available_cash_minor, current_exposure_minor,
+                              current_position_quantity, cash_cap_minor, exposure_cap_minor,
+                              fee_buffer_minor, reserved_cash_minor, reserved_exposure_minor,
+                              reserved_sell_quantity
+                       FROM risk_reservations WHERE client_order_id=?""",
+                    (client_order_id,),
+                ).fetchone()
+                supplied_terms = (
+                    reservation_terms.account_id, reservation_terms.account_snapshot_id,
+                    reservation_terms.environment.value, reservation_terms.policy_version,
+                    reservation_terms.instrument.market, reservation_terms.instrument.symbol,
+                    reservation_terms.account_currency, reservation_terms.instrument_currency,
+                    reservation_terms.side.value, reservation_terms.quantity,
+                    reservation_terms.available_cash_minor,
+                    reservation_terms.current_exposure_minor,
+                    reservation_terms.current_position_quantity,
+                    reservation_terms.cash_cap_minor, reservation_terms.exposure_cap_minor,
+                    reservation_terms.fee_buffer_minor,
+                    reservation_terms.reserved_cash_minor,
+                    reservation_terms.reserved_exposure_minor,
+                    reservation_terms.reserved_sell_quantity,
+                )
+                if existing_terms != supplied_terms:
+                    raise OrderReservationConflict(
+                        "client_order_id has different immutable reservation terms"
+                    )
                 self.connection.execute("COMMIT")
                 return False
+            cutoff = int(self.connection.execute(
+                "SELECT value FROM schema_metadata WHERE key='risk_reservation_v9_order_cutoff'"
+            ).fetchone()[0])
+            legacy_blocker = self.connection.execute(
+                """SELECT 1 FROM order_requests o
+                   WHERE o.rowid <= ?
+                     AND json_extract(o.canonical_json,'$.request.account_id') = ?
+                     AND NOT EXISTS (SELECT 1 FROM risk_reservations r
+                       WHERE r.client_order_id=o.client_order_id)
+                     AND COALESCE((SELECT e.event_type FROM ledger_events e
+                       WHERE e.aggregate_id=o.client_order_id AND e.event_type IN
+                         ('PREPARED','SUBMISSION_STARTED','ACKNOWLEDGED',
+                          'SUBMISSION_REJECTED','SUBMITTED_UNKNOWN')
+                       ORDER BY e.sequence DESC LIMIT 1),'PREPARED') != 'SUBMISSION_REJECTED'
+                     AND NOT EXISTS (SELECT 1 FROM ledger_events resolved
+                       WHERE resolved.aggregate_id=o.client_order_id
+                         AND resolved.event_type='SUBMITTED_UNKNOWN_RESOLVED'
+                         AND json_extract(resolved.payload_json,'$.result')='CONFIRMED_ABSENT')
+                   LIMIT 1""",
+                (cutoff, reservation_terms.account_id),
+            ).fetchone()
+            if legacy_blocker is not None:
+                raise ReservationCapacityExceeded(
+                    "legacy active order has no deterministic risk projection"
+                )
+            active = self.connection.execute(
+                """SELECT
+                     COALESCE(SUM(r.reserved_cash_minor - COALESCE(rel.cash,0)),0),
+                     COALESCE(SUM(r.reserved_exposure_minor - COALESCE(rel.exposure,0)),0)
+                   FROM risk_reservations r
+                   LEFT JOIN (SELECT aggregate_id,
+                     SUM(json_extract(payload_json,'$.reserved_cash_minor')) cash,
+                     SUM(json_extract(payload_json,'$.reserved_exposure_minor')) exposure
+                     FROM ledger_events WHERE event_type='RISK_RELEASED'
+                     GROUP BY aggregate_id) rel ON rel.aggregate_id=r.client_order_id
+                   WHERE r.account_id=?""",
+                (reservation_terms.account_id,),
+            ).fetchone()
+            active_sell = int(self.connection.execute(
+                """SELECT COALESCE(SUM(r.reserved_sell_quantity - COALESCE(rel.qty,0)),0)
+                   FROM risk_reservations r
+                   LEFT JOIN (SELECT aggregate_id,
+                     SUM(json_extract(payload_json,'$.reserved_sell_quantity')) qty
+                     FROM ledger_events WHERE event_type='RISK_RELEASED'
+                     GROUP BY aggregate_id) rel ON rel.aggregate_id=r.client_order_id
+                   WHERE r.account_id=? AND r.market=? AND r.symbol=?""",
+                (
+                    reservation_terms.account_id, reservation_terms.instrument.market,
+                    reservation_terms.instrument.symbol,
+                ),
+            ).fetchone()[0])
+            cash_total = int(active[0]) + reservation_terms.reserved_cash_minor
+            exposure_total = (
+                reservation_terms.current_exposure_minor + int(active[1])
+                + reservation_terms.reserved_exposure_minor
+            )
+            if (
+                cash_total > reservation_terms.available_cash_minor
+                or cash_total > reservation_terms.cash_cap_minor
+                or exposure_total > reservation_terms.exposure_cap_minor
+                or active_sell + reservation_terms.reserved_sell_quantity
+                > reservation_terms.current_position_quantity
+            ):
+                raise ReservationCapacityExceeded("account risk reservation capacity exceeded")
+            self.connection.execute(
+                """INSERT INTO risk_reservations VALUES
+                   (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    client_order_id, reservation_terms.account_id,
+                    reservation_terms.account_snapshot_id,
+                    reservation_terms.environment.value, reservation_terms.policy_version,
+                    reservation_terms.instrument.market, reservation_terms.instrument.symbol,
+                    reservation_terms.account_currency, reservation_terms.instrument_currency,
+                    reservation_terms.side.value, reservation_terms.quantity,
+                    reservation_terms.available_cash_minor,
+                    reservation_terms.current_exposure_minor,
+                    reservation_terms.current_position_quantity,
+                    reservation_terms.cash_cap_minor, reservation_terms.exposure_cap_minor,
+                    reservation_terms.fee_buffer_minor,
+                    reservation_terms.reserved_cash_minor,
+                    reservation_terms.reserved_exposure_minor,
+                    reservation_terms.reserved_sell_quantity, recorded_at,
+                ),
+            )
+            self._insert_event(
+                LedgerEvent(
+                    f"risk-reserved:{prepared_event.event_id}", "RISK_RESERVED",
+                    client_order_id, prepared_event.occurred_at,
+                    self._risk_payload(reservation_terms),
+                ),
+                recorded_at,
+            )
             try:
                 self.connection.execute(
                     "INSERT INTO order_requests VALUES (?, ?, ?)",
                     (client_order_id, canonical, recorded_at),
                 )
             except sqlite3.IntegrityError as error:
-                consumed = permit_id is not None and self.connection.execute(
+                consumed = self.connection.execute(
                     """SELECT 1 FROM order_requests
                        WHERE json_type(canonical_json, '$.permit.permit_id') = 'text'
                          AND json_extract(canonical_json, '$.permit.permit_id') = ?""",
@@ -1043,6 +1850,31 @@ class SQLiteLedger:
                 self.connection.execute("ROLLBACK")
             raise
 
+    def complete_submission(self, terminal_event: LedgerEvent) -> None:
+        require_id(terminal_event.event_id, "event_id")
+        require_id(terminal_event.aggregate_id, "aggregate_id")
+        require_utc(terminal_event.occurred_at, "occurred_at")
+        if terminal_event.event_type not in {
+            "ACKNOWLEDGED", "SUBMISSION_REJECTED", "SUBMITTED_UNKNOWN",
+        }:
+            raise ValueError("submission completion requires a terminal submission event")
+        recorded_at = datetime.now(timezone.utc).isoformat()
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            self._insert_event(terminal_event, recorded_at)
+            if terminal_event.event_type == "SUBMISSION_REJECTED":
+                self._insert_full_release(
+                    terminal_event.aggregate_id,
+                    f"risk-released:{terminal_event.event_id}",
+                    terminal_event.occurred_at,
+                    recorded_at,
+                )
+            self.connection.execute("COMMIT")
+        except BaseException:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
+
     def append(self, event: LedgerEvent) -> None:
         require_id(event.event_id, "event_id")
         require_id(event.event_type, "event_type")
@@ -1051,6 +1883,7 @@ class SQLiteLedger:
         if (
             event.event_type.startswith("OPERATOR_COMMAND_")
             or event.event_type == "SUBMITTED_UNKNOWN_RESOLVED"
+            or event.event_type in {"RISK_RESERVED", "RISK_RELEASED"}
         ):
             raise ValueError("audited events require their dedicated ledger operation")
         try:
@@ -1071,6 +1904,7 @@ class SQLiteLedger:
             "requested_at": command.requested_at.isoformat(),
             "expires_at": command.expires_at.isoformat(), "action": command.action.value,
             "account_id": command.account_id,
+            "environment": command.environment.value,
             "client_order_id": command.client_order_id,
             "risk_decision_id": command.risk_decision_id,
             "execution_plan_id": command.execution_plan_id,
@@ -1244,22 +2078,17 @@ class SQLiteLedger:
         self,
         client_order_id: str,
         command: OperatorCommand,
-        evidence: UnknownResolutionEvidence,
+        evidence: TypedUnknownResolutionEvidence,
         event: LedgerEvent,
     ) -> None:
         require_id(client_order_id, "client_order_id")
         require_id(event.event_id, "event_id")
         require_utc(event.occurred_at, "occurred_at")
-        require_utc(evidence.observed_at, "evidence.observed_at")
-        if evidence.observed_at > event.occurred_at:
+        if type(evidence) not in TYPED_UNKNOWN_RESOLUTION_TYPES:
+            raise TypeError("exact typed unknown-resolution evidence is required")
+        if evidence.evidence.fetched_at > event.occurred_at:
             raise ValueError("unknown-resolution evidence cannot postdate its event")
-        expected_payload = {
-            "operator_command_id": command.command_id,
-            "result": evidence.result.value,
-            "observation": evidence.observation,
-            "reference": evidence.reference,
-            "observed_at": evidence.observed_at.isoformat(),
-        }
+        expected_payload = canonical_resolution_payload(command.command_id, evidence)
         if (
             event.aggregate_id != client_order_id
             or event.event_type != "SUBMITTED_UNKNOWN_RESOLVED"
@@ -1282,14 +2111,20 @@ class SQLiteLedger:
             if order_row is None or command_row is None:
                 raise ValueError("resolution requires reserved order and operator command")
             try:
-                order_account = json.loads(order_row[0])["request"]["account_id"]
+                order_payload = json.loads(order_row[0])
+                order_account = order_payload["request"]["account_id"]
+                order_environment = TradingEnvironment(order_payload["environment"])
             except (KeyError, TypeError, json.JSONDecodeError) as error:
-                raise ValueError("order reservation has no internal account alias") from error
+                raise ValueError("order reservation has no account/environment scope") from error
             if (
                 order_account != command.account_id
+                or order_environment is not command.environment
+                or order_environment is not evidence.evidence.environment
                 or command_row[0] != self._json(self.canonical_command(command), canonical=True)
             ):
-                raise ValueError("operator command account or immutable payload does not match")
+                raise ValueError(
+                    "reserved order, operator command, and evidence scope do not match"
+                )
             chain = self.connection.execute(
                 """SELECT
                      MAX(CASE WHEN event_type='SUBMITTED_UNKNOWN' THEN sequence END),
@@ -1311,7 +2146,19 @@ class SQLiteLedger:
                 raise ValueError("submission is not unresolved UNKNOWN")
             if requested is None or terminal is not None:
                 raise ValueError("operator command audit chain is not pending")
-            self._insert_event(event, datetime.now(timezone.utc).isoformat())
+            recorded_at = datetime.now(timezone.utc).isoformat()
+            self._insert_event(event, recorded_at)
+            if (
+                type(evidence) is ConfirmedAbsent
+                and self.connection.execute(
+                    "SELECT 1 FROM risk_reservations WHERE client_order_id=?",
+                    (client_order_id,),
+                ).fetchone() is not None
+            ):
+                self._insert_full_release(
+                    client_order_id, f"risk-released:{event.event_id}",
+                    event.occurred_at, recorded_at,
+                )
             self.connection.execute("COMMIT")
         except sqlite3.Error as error:
             if self.connection.in_transaction:
@@ -1322,22 +2169,35 @@ class SQLiteLedger:
                 self.connection.execute("ROLLBACK")
             raise
 
-    def incomplete_submissions(self, account_id: str | None = None) -> tuple[str, ...]:
+    def incomplete_submissions(
+        self,
+        account_id: str | None = None,
+        environment: TradingEnvironment | None = None,
+    ) -> tuple[str, ...]:
         if account_id is not None:
             require_id(account_id, "account_id")
+        if environment is not None and type(environment) is not TradingEnvironment:
+            raise ValueError("environment must be TradingEnvironment")
         account_join = ""
         account_filter = ""
         parameters: tuple[str, ...] = ()
-        if account_id is not None:
+        if account_id is not None or environment is not None:
             account_join = (
                 " JOIN order_requests AS reserved"
                 " ON reserved.client_order_id = event.aggregate_id"
             )
+        if account_id is not None:
             account_filter = (
                 " AND json_type(reserved.canonical_json, '$.request.account_id') = 'text'"
                 " AND json_extract(reserved.canonical_json, '$.request.account_id') = ?"
             )
             parameters = (account_id,)
+        if environment is not None:
+            account_filter += (
+                " AND json_type(reserved.canonical_json, '$.environment') = 'text'"
+                " AND json_extract(reserved.canonical_json, '$.environment') = ?"
+            )
+            parameters += (environment.value,)
         rows = self.connection.execute(
             f"""SELECT event.aggregate_id FROM ledger_events AS event{account_join}
                WHERE event.event_type = 'SUBMISSION_STARTED' AND event.sequence = (
@@ -1352,23 +2212,34 @@ class SQLiteLedger:
         return tuple(row[0] for row in rows)
 
     def unresolved_unknown_submissions(
-        self, account_id: str | None = None,
+        self,
+        account_id: str | None = None,
+        environment: TradingEnvironment | None = None,
     ) -> tuple[str, ...]:
         if account_id is not None:
             require_id(account_id, "account_id")
+        if environment is not None and type(environment) is not TradingEnvironment:
+            raise ValueError("environment must be TradingEnvironment")
         account_join = ""
         account_filter = ""
         parameters: tuple[str, ...] = ()
-        if account_id is not None:
+        if account_id is not None or environment is not None:
             account_join = (
                 " JOIN order_requests AS reserved"
                 " ON reserved.client_order_id = unknown_event.aggregate_id"
             )
+        if account_id is not None:
             account_filter = (
                 " AND json_type(reserved.canonical_json, '$.request.account_id') = 'text'"
                 " AND json_extract(reserved.canonical_json, '$.request.account_id') = ?"
             )
             parameters = (account_id,)
+        if environment is not None:
+            account_filter += (
+                " AND json_type(reserved.canonical_json, '$.environment') = 'text'"
+                " AND json_extract(reserved.canonical_json, '$.environment') = ?"
+            )
+            parameters += (environment.value,)
         rows = self.connection.execute(
             f"""SELECT unknown_event.aggregate_id
                FROM ledger_events AS unknown_event{account_join}
@@ -1389,8 +2260,61 @@ class SQLiteLedger:
             "SELECT COALESCE(MAX(sequence), 0) FROM ledger_events"
         ).fetchone()[0])
 
+    def physical_integrity_check(self) -> bool:
+        """Return whether SQLite's physical integrity check reports ``ok``."""
+        try:
+            return self.connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+        except Exception:
+            return False
+
+    def foreign_key_check(self) -> bool:
+        """Return whether SQLite reports no foreign-key violations."""
+        try:
+            return self.connection.execute("PRAGMA foreign_key_check").fetchone() is None
+        except Exception:
+            return False
+
+    def schema_contract_check(self) -> bool:
+        """Return whether the current database matches its declared schema contract."""
+        try:
+            self._validate_schema(self.connection, self.schema_version)
+            return True
+        except Exception:
+            return False
+
+    def audit_semantic_check(self) -> bool:
+        """Return whether the current ledger history satisfies audit semantics."""
+        try:
+            version = self.schema_version
+            if not 0 <= version <= SCHEMA_VERSION:
+                return False
+            self._validate_audit_semantics(self.connection, version=version)
+            return True
+        except Exception:
+            return False
+
+    def submission_state_check(self) -> bool:
+        """Return whether submission events form a valid historical state machine."""
+        try:
+            self._validate_submission_states(self.connection)
+            return True
+        except Exception:
+            return False
+
+    def full_ledger_verify(self) -> bool:
+        """Run every read-only ledger verification and require all to pass."""
+        checks = (
+            self.physical_integrity_check(),
+            self.foreign_key_check(),
+            self.schema_contract_check(),
+            self.audit_semantic_check(),
+            self.submission_state_check(),
+        )
+        return all(checks)
+
     def integrity_check(self) -> bool:
-        return self.connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+        """Backward-compatible alias for the physical SQLite check only."""
+        return self.physical_integrity_check()
 
     @classmethod
     def _verify_version(
@@ -1499,7 +2423,9 @@ class SQLiteLedger:
             if hashlib.sha256(backup_bytes).hexdigest() != manifest["sha256"]:
                 raise BackupError("backup hash does not match manifest")
             declared_version = manifest["schema_version"]
-            if type(declared_version) is not int or declared_version not in {6, SCHEMA_VERSION}:
+            if type(declared_version) is not int or declared_version not in {
+                6, 7, 8, 9, SCHEMA_VERSION,
+            }:
                 raise BackupError("manifest schema version is unsupported")
             require_utc(datetime.fromisoformat(manifest["created_at"]), "created_at")
             require_id(manifest["app_version"], "app_version")

@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import StrEnum
+from math import isfinite
+import re
 
 
 def require_id(value: str, name: str) -> None:
@@ -24,6 +26,14 @@ def require_decimal(value: Decimal, name: str) -> None:
 def require_enum(value: object, enum_type: type[StrEnum], name: str) -> None:
     if not isinstance(value, enum_type):
         raise ValueError(f"{name} must be a {enum_type.__name__}")
+
+
+SIGNED_64_MAX = (1 << 63) - 1
+
+
+def require_minor_integer(value: int, name: str) -> None:
+    if type(value) is not int or not 0 <= value <= SIGNED_64_MAX:
+        raise ValueError(f"{name} must be a non-negative signed 64-bit integer")
 
 
 class RiskStage(StrEnum):
@@ -74,6 +84,12 @@ class PermitScope(StrEnum):
     CANCEL = "CANCEL"
     REDUCE_ONLY = "REDUCE_ONLY"
     EMERGENCY_FLATTEN = "EMERGENCY_FLATTEN"
+
+
+class TradingEnvironment(StrEnum):
+    SIMULATED = "SIMULATED"
+    PAPER = "PAPER"
+    LIVE = "LIVE"
 
 
 class SafetyState(StrEnum):
@@ -132,6 +148,124 @@ class InstrumentId:
     def __post_init__(self) -> None:
         for name in ("market", "symbol", "currency"):
             require_id(getattr(self, name), name)
+
+
+@dataclass(frozen=True)
+class ReservationPosition:
+    instrument: InstrumentId
+    quantity: int
+
+    def __post_init__(self) -> None:
+        if type(self.instrument) is not InstrumentId:
+            raise ValueError("instrument must be exact InstrumentId")
+        require_minor_integer(self.quantity, "quantity")
+
+
+@dataclass(frozen=True)
+class ReservationAccountState:
+    account_id: str
+    account_snapshot_id: str
+    account_currency: str
+    available_cash_minor: int
+    current_exposure_minor: int
+    positions: tuple[ReservationPosition, ...]
+
+    def __post_init__(self) -> None:
+        for name in ("account_id", "account_snapshot_id", "account_currency"):
+            require_id(getattr(self, name), name)
+        for name in ("available_cash_minor", "current_exposure_minor"):
+            require_minor_integer(getattr(self, name), name)
+        if type(self.positions) is not tuple or any(
+            type(position) is not ReservationPosition for position in self.positions
+        ):
+            raise ValueError("positions must be an exact tuple of ReservationPosition")
+        for position in self.positions:
+            ReservationPosition.__post_init__(position)
+        instruments = tuple(position.instrument for position in self.positions)
+        if len(set(instruments)) != len(instruments):
+            raise ValueError("reservation positions must have unique instruments")
+        if self.account_currency != "USD" or any(
+            position.instrument.currency != self.account_currency
+            for position in self.positions
+        ):
+            raise ValueError("Phase 1B reservation account state supports USD only")
+
+
+@dataclass(frozen=True)
+class RiskReservationPolicy:
+    policy_version: str
+    cash_cap_minor: int
+    exposure_cap_minor: int
+    fee_buffer_minor: int
+
+    def __post_init__(self) -> None:
+        require_id(self.policy_version, "policy_version")
+        for name in ("cash_cap_minor", "exposure_cap_minor", "fee_buffer_minor"):
+            require_minor_integer(getattr(self, name), name)
+
+
+@dataclass(frozen=True)
+class ReservationTerms:
+    """Immutable, same-currency capacity facts for one order submission."""
+
+    account_id: str
+    account_snapshot_id: str
+    environment: TradingEnvironment
+    policy_version: str
+    instrument: InstrumentId
+    side: Side
+    quantity: int
+    account_currency: str
+    instrument_currency: str
+    available_cash_minor: int
+    current_exposure_minor: int
+    current_position_quantity: int
+    cash_cap_minor: int
+    exposure_cap_minor: int
+    fee_buffer_minor: int
+    reserved_cash_minor: int
+    reserved_exposure_minor: int
+    reserved_sell_quantity: int
+
+    def __post_init__(self) -> None:
+        for name in (
+            "account_id", "account_snapshot_id", "policy_version",
+            "account_currency", "instrument_currency",
+        ):
+            require_id(getattr(self, name), name)
+        require_enum(self.environment, TradingEnvironment, "environment")
+        require_enum(self.side, Side, "side")
+        if type(self.instrument) is not InstrumentId:
+            raise ValueError("instrument must be exact InstrumentId")
+        for name in (
+            "quantity", "available_cash_minor", "current_exposure_minor",
+            "current_position_quantity", "cash_cap_minor", "exposure_cap_minor",
+            "fee_buffer_minor", "reserved_cash_minor", "reserved_exposure_minor",
+            "reserved_sell_quantity",
+        ):
+            require_minor_integer(getattr(self, name), name)
+        if self.quantity == 0:
+            raise ValueError("reservation quantity must be positive")
+        if not (
+            self.account_currency == self.instrument_currency
+            == self.instrument.currency == "USD"
+        ):
+            raise ValueError("Phase 1B reservations support same-currency USD only")
+        if self.side is Side.BUY:
+            if (
+                self.reserved_exposure_minor == 0
+                or self.reserved_cash_minor
+                != self.reserved_exposure_minor + self.fee_buffer_minor
+                or self.reserved_sell_quantity != 0
+            ):
+                raise ValueError("BUY reservation amounts are inconsistent")
+        elif (
+            self.reserved_cash_minor != 0
+            or self.reserved_exposure_minor != 0
+            or self.reserved_sell_quantity != self.quantity
+            or self.fee_buffer_minor != 0
+        ):
+            raise ValueError("SELL reservation amounts are inconsistent")
 
 
 @dataclass(frozen=True)
@@ -222,6 +356,16 @@ class RiskDecision:
             require_id(getattr(self, name), name)
         require_enum(self.risk_stage, RiskStage, "risk_stage")
         require_enum(self.outcome, RiskOutcome, "outcome")
+        if type(self.reason_codes) is not tuple or any(
+            not isinstance(code, str)
+            or re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", code) is None
+            for code in self.reason_codes
+        ):
+            raise ValueError("risk reason codes must be machine-readable uppercase codes")
+        if len(set(self.reason_codes)) != len(self.reason_codes):
+            raise ValueError("risk reason codes cannot contain duplicates")
+        if self.outcome in {RiskOutcome.ADJUSTED, RiskOutcome.REJECTED} and not self.reason_codes:
+            raise ValueError("adjusted/rejected risk requires a reason code")
         for name in ("original_quantity", "approved_quantity"):
             value = getattr(self, name)
             if value is not None:
@@ -264,21 +408,53 @@ class ExecutionPlan:
     time_in_force: TimeInForce
     quantity: Decimal
     limit_price: Decimal
+    market_evidence: MarketEvidence
+    pricing_policy_version: str
+    created_at: datetime
     expires_at: datetime
+    minimum_limit_price: Decimal
+    maximum_limit_price: Decimal
+    clock_session_id: str
+    created_monotonic: float
+    expires_monotonic: float
 
     def __post_init__(self) -> None:
-        for name in ("plan_id", "intent_id", "risk_decision_id"):
+        for name in (
+            "plan_id", "intent_id", "risk_decision_id", "pricing_policy_version",
+            "clock_session_id",
+        ):
             require_id(getattr(self, name), name)
         require_enum(self.side, Side, "side")
         require_enum(self.order_type, OrderType, "order_type")
         require_enum(self.time_in_force, TimeInForce, "time_in_force")
-        for name in ("quantity", "limit_price"):
+        for name in (
+            "quantity", "limit_price", "minimum_limit_price", "maximum_limit_price",
+        ):
             require_decimal(getattr(self, name), name)
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
+        if type(self.market_evidence) is not MarketEvidence:
+            raise ValueError("market_evidence must be exact MarketEvidence")
+        if (
+            self.pricing_policy_version != self.market_evidence.pricing_policy_version
+            or self.minimum_limit_price != self.market_evidence.minimum_limit_price
+            or self.maximum_limit_price != self.market_evidence.maximum_limit_price
+        ):
+            raise ValueError("execution plan must preserve authoritative market policy band")
+        if not self.minimum_limit_price <= self.limit_price <= self.maximum_limit_price:
+            raise ValueError("limit_price must be inside the allowed band")
         if self.order_type is not OrderType.LIMIT or self.time_in_force is not TimeInForce.DAY:
             raise ValueError("Phase 1A execution supports LIMIT DAY only")
+        require_utc(self.created_at, "created_at")
         require_utc(self.expires_at, "expires_at")
+        if self.expires_at <= self.created_at:
+            raise ValueError("execution plan must expire after creation")
+        for name in ("created_monotonic", "expires_monotonic"):
+            value = getattr(self, name)
+            if type(value) not in (int, float) or not isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be a non-negative monotonic reading")
+        if self.expires_monotonic <= self.created_monotonic:
+            raise ValueError("execution plan monotonic expiry must follow creation")
 
 
 @dataclass(frozen=True)
@@ -408,6 +584,7 @@ class ObservedAmount:
 class AccountSnapshot:
     snapshot_id: str
     account_id: str
+    environment: TradingEnvironment
     quality: SnapshotQuality
     cash: ObservedAmount
     buying_power: ObservedAmount
@@ -420,6 +597,7 @@ class AccountSnapshot:
     def __post_init__(self) -> None:
         require_id(self.snapshot_id, "snapshot_id")
         require_id(self.account_id, "account_id")
+        require_enum(self.environment, TradingEnvironment, "environment")
         require_enum(self.quality, SnapshotQuality, "quality")
         require_utc(self.captured_at, "captured_at")
 
@@ -443,13 +621,25 @@ class AccountSnapshot:
 @dataclass(frozen=True)
 class MarketEvidence:
     snapshot_id: str
+    environment: TradingEnvironment
     quality: SnapshotQuality
     observed_at: datetime
+    pricing_policy_version: str
+    minimum_limit_price: Decimal
+    maximum_limit_price: Decimal
 
     def __post_init__(self) -> None:
         require_id(self.snapshot_id, "snapshot_id")
+        require_enum(self.environment, TradingEnvironment, "environment")
         require_enum(self.quality, SnapshotQuality, "quality")
         require_utc(self.observed_at, "observed_at")
+        require_id(self.pricing_policy_version, "pricing_policy_version")
+        for name in ("minimum_limit_price", "maximum_limit_price"):
+            require_decimal(getattr(self, name), name)
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive")
+        if self.maximum_limit_price < self.minimum_limit_price:
+            raise ValueError("market evidence price band is inverted")
 
     def is_fresh_consistent(self, now: datetime, max_age_seconds: int) -> bool:
         require_utc(now, "now")
@@ -464,6 +654,7 @@ class MarketEvidence:
 class TradingPermit:
     permit_id: str
     account_id: str
+    environment: TradingEnvironment
     scope: PermitScope
     safety_epoch: int
     client_order_id: str | None
@@ -482,6 +673,7 @@ class TradingPermit:
         if self.safety_epoch < 0:
             raise ValueError("safety_epoch cannot be negative")
         require_enum(self.scope, PermitScope, "scope")
+        require_enum(self.environment, TradingEnvironment, "environment")
         binding_claims = (
             self.client_order_id,
             self.risk_decision_id,
@@ -528,6 +720,7 @@ class OperatorCommand:
     expires_at: datetime
     action: OperatorAction
     account_id: str
+    environment: TradingEnvironment
     client_order_id: str | None = None
     risk_decision_id: str | None = None
     execution_plan_id: str | None = None
@@ -538,6 +731,7 @@ class OperatorCommand:
         if self.expected_safety_epoch < 0:
             raise ValueError("expected_safety_epoch cannot be negative")
         require_enum(self.action, OperatorAction, "action")
+        require_enum(self.environment, TradingEnvironment, "environment")
         require_utc(self.requested_at, "requested_at")
         require_utc(self.expires_at, "expires_at")
         if self.expires_at <= self.requested_at:
@@ -555,17 +749,3 @@ class OperatorCommand:
                 raise ValueError(
                     "unknown resolution cannot carry risk or plan binding claims"
                 )
-
-
-@dataclass(frozen=True)
-class UnknownResolutionEvidence:
-    result: UnknownResolutionResult
-    observation: str
-    reference: str
-    observed_at: datetime
-
-    def __post_init__(self) -> None:
-        require_enum(self.result, UnknownResolutionResult, "result")
-        require_id(self.observation, "observation")
-        require_id(self.reference, "reference")
-        require_utc(self.observed_at, "observed_at")

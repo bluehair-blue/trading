@@ -1,26 +1,39 @@
 from collections.abc import Callable
 from contextlib import AbstractContextManager, ExitStack
 from datetime import datetime, timezone
+from math import isfinite
 import re
 from typing import Protocol
 from uuid import uuid4
 
 from trader.application.safety import SafetyController
 from trader.application.operator import OperatorCommandService
+from trader.domain.broker_observations import (
+    TYPED_UNKNOWN_RESOLUTION_TYPES,
+    TypedUnknownResolutionEvidence,
+)
 from trader.domain.models import (
     ExecutionPlan,
     OperatorCommand,
     OrderRequest,
     PermitScope,
     RiskDecision,
+    ReservationAccountState,
+    ReservationTerms,
+    RiskReservationPolicy,
     RiskOutcome,
     RiskStage,
     Side,
+    SnapshotQuality,
     SubmissionState,
     TradeIntent,
     TradingPermit,
-    UnknownResolutionEvidence,
     require_utc,
+)
+from trader.ports.clock import (
+    MonotonicClock,
+    PROCESS_CLOCK_SESSION_ID,
+    system_monotonic,
 )
 from trader.ports.broker import (
     Broker,
@@ -59,7 +72,7 @@ class ProcessLock(Protocol):
     def hold(self, account_alias: str) -> AbstractContextManager[None]: ...
 
 
-class ExecutionService:
+class OrderCoordinator:
     def __init__(
         self,
         broker: Broker,
@@ -69,9 +82,13 @@ class ExecutionService:
         process_lock: ProcessLock | None = None,
         *,
         account_id: str,
+        monotonic_clock: MonotonicClock = system_monotonic,
+        clock_session_id: str = PROCESS_CLOCK_SESSION_ID,
     ) -> None:
         if type(broker.environment) is not BrokerEnvironment:
             raise ValueError("broker environment must be BrokerEnvironment")
+        if safety.environment is not broker.environment:
+            raise SubmissionValidationError("safety and broker environments must match")
         self.broker = broker
         self.ledger = ledger
         self.process_lock = process_lock
@@ -81,12 +98,20 @@ class ExecutionService:
         self._require_live_lock(self.account_id)
         self.safety = safety
         self.clock = clock
+        self.monotonic_clock = monotonic_clock
+        self.clock_session_id = clock_session_id
+        self._last_monotonic: float | None = None
         self._do_not_retry: set[str] = set()
+        self._invalid_plans: set[str] = set()
         if self.broker.environment is BrokerEnvironment.LIVE:
             with self._held_live_lock():
-                self._recover_incomplete_submissions(self.account_id)
+                self._recover_incomplete_submissions(
+                    self.account_id, self.broker.environment
+                )
         else:
-            self._recover_incomplete_submissions(self.account_id)
+            self._recover_incomplete_submissions(
+                self.account_id, self.broker.environment
+            )
 
     def submit(
         self,
@@ -99,9 +124,13 @@ class ExecutionService:
         if request.account_id != self.account_id:
             raise SubmissionValidationError("request account does not match the service account")
         if self.broker.environment is not BrokerEnvironment.LIVE:
-            return self._submit(request, risk_decision, plan, intent, permit)
+            return self._submit(
+                request, risk_decision, plan, intent, permit
+            )
         with self._held_live_lock():
-            return self._submit(request, risk_decision, plan, intent, permit)
+            return self._submit(
+                request, risk_decision, plan, intent, permit
+            )
 
     def _submit(
         self,
@@ -116,10 +145,27 @@ class ExecutionService:
         try:
             now = self.clock()
             require_utc(now, "pre_submit_time")
+            monotonic_now = self.monotonic_clock()
+            if (
+                type(monotonic_now) not in (int, float)
+                or not isfinite(monotonic_now)
+                or monotonic_now < 0
+                or (
+                    self._last_monotonic is not None
+                    and monotonic_now < self._last_monotonic
+                )
+            ):
+                raise ValueError("invalid monotonic reading")
+            self._last_monotonic = float(monotonic_now)
         except Exception as error:
             self.safety.halt("CLOCK_FAILURE")
             raise SubmissionValidationError("clock failure halted submission") from error
-        self._validate_evidence(request, risk_decision, plan, intent, permit, now)
+        self._validate_evidence(
+            request, risk_decision, plan, intent, permit, now, self._last_monotonic
+        )
+        reservation_terms = self._derive_reservation_terms(
+            request, risk_decision, plan, intent
+        )
         prepared = LedgerEvent(
             str(uuid4()), SubmissionState.PREPARED, request.client_order_id, now,
             {
@@ -137,7 +183,8 @@ class ExecutionService:
                 self._canonical_payload(request, risk_decision, plan, intent, permit),
                 prepared,
                 submission_started,
-                None if permit is None else permit.permit_id,
+                permit.permit_id,
+                reservation_terms,
             )
         except OrderReservationConflict:
             raise
@@ -163,24 +210,99 @@ class ExecutionService:
             require_utc(occurred_at, "post_submit_time")
         except Exception as error:
             self.safety.block_unknown_submission(request.client_order_id)
-            self._record(
-                request.client_order_id,
-                SubmissionState.SUBMITTED_UNKNOWN,
-                now,
-                detail_code=self._exception_code(error),
+            self._complete_submission(
+                LedgerEvent(
+                    str(uuid4()), SubmissionState.SUBMITTED_UNKNOWN.value,
+                    request.client_order_id, now,
+                    {"broker_order_id": None, "detail_code": self._exception_code(error)},
+                )
             )
             return SubmissionState.SUBMITTED_UNKNOWN
 
         if state is SubmissionState.SUBMITTED_UNKNOWN:
             self.safety.block_unknown_submission(request.client_order_id)
-        self._record(
-            request.client_order_id,
-            state,
-            occurred_at,
-            result.broker_order_id,
-            result.detail_code,
+        self._complete_submission(
+            LedgerEvent(
+                str(uuid4()), state.value, request.client_order_id, occurred_at,
+                {
+                    "broker_order_id": result.broker_order_id,
+                    "detail_code": result.detail_code,
+                },
+            )
         )
         return state
+
+    def _derive_reservation_terms(
+        self,
+        request: OrderRequest,
+        risk: RiskDecision,
+        plan: ExecutionPlan,
+        intent: TradeIntent,
+    ) -> ReservationTerms:
+        evidence = self.safety.evidence
+        if evidence is None:
+            raise SubmissionValidationError("current reservation evidence is required")
+        state = evidence.reservation_account_state
+        policy = evidence.risk_reservation_policy
+        if (
+            type(state) is not ReservationAccountState
+            or type(policy) is not RiskReservationPolicy
+        ):
+            raise SubmissionValidationError("exact reservation evidence is required")
+        try:
+            ReservationAccountState.__post_init__(state)
+            RiskReservationPolicy.__post_init__(policy)
+            minor_notional = request.limit_price * request.quantity * 100
+            if minor_notional != minor_notional.to_integral_value():
+                raise ValueError("limit notional is not an exact minor-unit amount")
+            notional = int(minor_notional)
+        except (ArithmeticError, ValueError) as error:
+            raise SubmissionValidationError("invalid reservation terms") from error
+        if not 0 <= notional <= (1 << 63) - 1:
+            raise SubmissionValidationError("limit notional exceeds signed 64-bit minor units")
+        if (
+            state.account_id != request.account_id
+            or state.account_id != evidence.account_snapshot.account_id
+            or state.account_snapshot_id != risk.input_snapshot_id
+            or state.account_snapshot_id != intent.account_snapshot_id
+            or state.account_snapshot_id != evidence.account_snapshot.snapshot_id
+            or policy.policy_version != risk.policy_version
+            or policy.policy_version != evidence.policy_version
+            or plan.market_evidence.environment is not self.broker.environment
+            or state.account_currency != request.instrument.currency
+        ):
+            raise SubmissionValidationError("reservation evidence does not match submission")
+        current_position = next(
+            (
+                position.quantity
+                for position in state.positions
+                if position.instrument == request.instrument
+            ),
+            0,
+        )
+        fee_buffer = policy.fee_buffer_minor if request.side is Side.BUY else 0
+        reserved_cash = notional + fee_buffer if request.side is Side.BUY else 0
+        if reserved_cash > (1 << 63) - 1:
+            raise SubmissionValidationError("reserved cash exceeds signed 64-bit minor units")
+        try:
+            return ReservationTerms(
+                state.account_id, state.account_snapshot_id, self.broker.environment,
+                policy.policy_version, request.instrument, request.side,
+                int(request.quantity), state.account_currency, request.instrument.currency,
+                state.available_cash_minor, state.current_exposure_minor,
+                current_position, policy.cash_cap_minor, policy.exposure_cap_minor,
+                fee_buffer, reserved_cash,
+                notional if request.side is Side.BUY else 0,
+                int(request.quantity) if request.side is Side.SELL else 0,
+            )
+        except ValueError as error:
+            raise SubmissionValidationError("invalid derived reservation terms") from error
+
+    def _complete_submission(self, event: LedgerEvent) -> None:
+        try:
+            self.ledger.complete_submission(event)
+        except Exception as error:
+            self._persistence_failed(event.aggregate_id, error)
 
     def _require_live_lock(self, account_id: str | None = None) -> None:
         if self.broker.environment is not BrokerEnvironment.LIVE:
@@ -224,6 +346,7 @@ class ExecutionService:
         intent: TradeIntent,
         permit: TradingPermit | None,
         now: datetime,
+        monotonic_now: float,
     ) -> None:
         if risk.risk_stage is not RiskStage.PRE_TRADE:
             raise SubmissionValidationError("submission requires PRE_TRADE risk")
@@ -249,31 +372,68 @@ class ExecutionService:
             or request.limit_price != plan.limit_price
             or request.order_type is not plan.order_type
             or request.time_in_force is not plan.time_in_force
+            or plan.pricing_policy_version != risk.policy_version
+            or plan.market_evidence.environment is not self.broker.environment
+            or plan.market_evidence.pricing_policy_version != plan.pricing_policy_version
+            or plan.market_evidence.minimum_limit_price != plan.minimum_limit_price
+            or plan.market_evidence.maximum_limit_price != plan.maximum_limit_price
+            or not plan.minimum_limit_price <= request.limit_price <= plan.maximum_limit_price
+            or not plan.created_at <= request.created_at < plan.expires_at
         ):
             raise SubmissionValidationError("request, risk, and execution plan do not match")
         if approved < 0 and abs(approved) > intent.current_quantity:
             raise SubmissionValidationError("long-only SELL exceeds current long position")
-        if now >= plan.expires_at:
+        if (
+            plan.market_evidence.quality is not SnapshotQuality.CONSISTENT
+            or plan.market_evidence.observed_at > plan.created_at
+        ):
+            raise SubmissionValidationError("execution plan market evidence is invalid")
+        if (
+            plan.plan_id in self._invalid_plans
+            or plan.clock_session_id != self.clock_session_id
+            or monotonic_now < plan.created_monotonic
+            or monotonic_now >= plan.expires_monotonic
+            or now >= plan.expires_at
+        ):
             raise SubmissionValidationError("execution plan has expired")
-        if self.broker.environment is not BrokerEnvironment.LIVE and permit is not None:
-            raise SubmissionValidationError("non-LIVE broker does not accept a permit")
-        if self.broker.environment is BrokerEnvironment.LIVE:
-            if permit is None:
-                raise SubmissionValidationError("LIVE broker requires issued permit")
-            self.safety.validate(
-                permit,
-                request.account_id,
-                PermitScope.NEW_ORDER,
-                now,
-                client_order_id=request.client_order_id,
-                risk_decision_id=risk.decision_id,
-                execution_plan_id=plan.plan_id,
-            )
-            if (
-                permit.account_snapshot_id != risk.input_snapshot_id
-                or permit.policy_version != risk.policy_version
-            ):
-                raise SubmissionValidationError("permit and risk evidence do not match")
+        if now < plan.created_at:
+            self._invalid_plans.add(plan.plan_id)
+            self.safety.halt("CLOCK_ROLLBACK")
+            raise SubmissionValidationError("wall clock rollback invalidated execution plan")
+        if permit is None:
+            raise SubmissionValidationError("broker submission requires issued permit")
+        if permit.environment is not self.broker.environment:
+            raise SubmissionValidationError("permit environment does not match broker")
+        self.safety.validate(
+            permit,
+            request.account_id,
+            PermitScope.NEW_ORDER,
+            now,
+            client_order_id=request.client_order_id,
+            risk_decision_id=risk.decision_id,
+            execution_plan_id=plan.plan_id,
+        )
+        if (
+            permit.account_snapshot_id != risk.input_snapshot_id
+            or permit.policy_version != risk.policy_version
+            or permit.market_snapshot_id != plan.market_evidence.snapshot_id
+        ):
+            raise SubmissionValidationError("permit and risk evidence do not match")
+        evidence = self.safety.evidence
+        if evidence is None or (
+            evidence.account_snapshot.environment is not self.broker.environment
+            or evidence.market.environment is not self.broker.environment
+            or plan.market_evidence.snapshot_id != evidence.market.snapshot_id
+            or plan.market_evidence.observed_at != evidence.market.observed_at
+            or plan.market_evidence.quality is not evidence.market.quality
+            or plan.market_evidence.pricing_policy_version
+            != evidence.market.pricing_policy_version
+            or plan.market_evidence.minimum_limit_price
+            != evidence.market.minimum_limit_price
+            or plan.market_evidence.maximum_limit_price
+            != evidence.market.maximum_limit_price
+        ):
+            raise SubmissionValidationError("execution plan market evidence is stale")
 
     def _canonical_payload(
         self,
@@ -284,6 +444,7 @@ class ExecutionService:
         permit: TradingPermit | None,
     ) -> dict[str, object]:
         return {
+            "environment": self.broker.environment.value,
             "request": {
                 "client_order_id": request.client_order_id,
                 "execution_plan_id": request.execution_plan_id,
@@ -305,6 +466,9 @@ class ExecutionService:
                 "stage": risk.risk_stage.value,
                 "policy_version": risk.policy_version,
                 "input_snapshot_id": risk.input_snapshot_id,
+                "input_snapshot_environment": (
+                    self.safety.evidence.account_snapshot.environment.value
+                ),
                 "trade_intent_id": risk.trade_intent_id,
                 "original_quantity": str(risk.original_quantity),
                 "approved_quantity": str(risk.approved_quantity),
@@ -338,10 +502,33 @@ class ExecutionService:
                 "time_in_force": plan.time_in_force.value,
                 "quantity": str(plan.quantity),
                 "limit_price": str(plan.limit_price),
+                "market_evidence": {
+                    "snapshot_id": plan.market_evidence.snapshot_id,
+                    "environment": plan.market_evidence.environment.value,
+                    "observed_at": plan.market_evidence.observed_at.isoformat(),
+                    "quality": plan.market_evidence.quality.value,
+                    "pricing_policy_version": (
+                        plan.market_evidence.pricing_policy_version
+                    ),
+                    "minimum_limit_price": str(
+                        plan.market_evidence.minimum_limit_price
+                    ),
+                    "maximum_limit_price": str(
+                        plan.market_evidence.maximum_limit_price
+                    ),
+                },
+                "pricing_policy_version": plan.pricing_policy_version,
+                "created_at": plan.created_at.isoformat(),
                 "expires_at": plan.expires_at.isoformat(),
+                "minimum_limit_price": str(plan.minimum_limit_price),
+                "maximum_limit_price": str(plan.maximum_limit_price),
+                "clock_session_id": plan.clock_session_id,
+                "created_monotonic": plan.created_monotonic,
+                "expires_monotonic": plan.expires_monotonic,
             },
             "permit": None if permit is None else {
                 "permit_id": permit.permit_id,
+                "environment": permit.environment.value,
                 "account_id": permit.account_id,
                 "scope": permit.scope.value,
                 "client_order_id": permit.client_order_id,
@@ -357,9 +544,13 @@ class ExecutionService:
             },
         }
 
-    def _recover_incomplete_submissions(self, account_id: str | None = None) -> None:
+    def _recover_incomplete_submissions(
+        self,
+        account_id: str | None = None,
+        environment: BrokerEnvironment | None = None,
+    ) -> None:
         try:
-            incomplete = self.ledger.incomplete_submissions(account_id)
+            incomplete = self.ledger.incomplete_submissions(account_id, environment)
             for client_order_id in incomplete:
                 self._record(
                     client_order_id,
@@ -367,7 +558,9 @@ class ExecutionService:
                     self.clock(),
                     detail_code="RESTART_RECOVERY",
                 )
-            for client_order_id in self.ledger.unresolved_unknown_submissions(account_id):
+            for client_order_id in self.ledger.unresolved_unknown_submissions(
+                account_id, environment
+            ):
                 self._do_not_retry.add(client_order_id)
                 self.safety.block_unknown_submission(client_order_id)
         except PersistenceFailure:
@@ -379,10 +572,10 @@ class ExecutionService:
         self,
         client_order_id: str,
         command: OperatorCommand,
-        evidence: UnknownResolutionEvidence,
+        evidence: TypedUnknownResolutionEvidence,
         operator_commands: OperatorCommandService,
     ) -> None:
-        if type(command) is not OperatorCommand or type(evidence) is not UnknownResolutionEvidence:
+        if type(command) is not OperatorCommand or type(evidence) not in TYPED_UNKNOWN_RESOLUTION_TYPES:
             raise TypeError("typed operator command and resolution evidence are required")
         if operator_commands.ledger is not self.ledger or operator_commands.safety is not self.safety:
             raise ValueError("operator and execution services must share ledger and safety")
@@ -417,3 +610,7 @@ class ExecutionService:
     def _exception_code(error: Exception) -> str:
         name = re.sub(r"[^A-Z0-9]+", "_", type(error).__name__.upper()).strip("_")
         return f"BROKER_{name}"[:64] or "BROKER_EXCEPTION"
+
+
+# Compatibility for the Phase 1A application name.
+ExecutionService = OrderCoordinator

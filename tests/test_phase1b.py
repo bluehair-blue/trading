@@ -3,8 +3,9 @@ import json
 import os
 import sqlite3
 import tempfile
+import threading
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 from unittest.mock import patch
@@ -18,6 +19,8 @@ from trader.adapters.persistence.sqlite_ledger import (
     V4_STATEMENTS,
     V5_STATEMENTS,
     V6_STATEMENTS,
+    V7_STATEMENTS,
+    V10_RESOLUTION_SQL,
     BackupError,
     SQLiteLedger,
     SchemaError,
@@ -28,23 +31,85 @@ from trader.application.operator import (
     OperatorPersistenceFailure,
 )
 from trader.application.safety import SafetyController
+from trader.domain.broker_observations import (
+    BrokerOrderLinked,
+    BrokerOrderRef,
+    ConfirmedAbsent,
+    ManualActivityLinked,
+    ResolutionQueryEvidence,
+    canonical_resolution_payload,
+)
 from trader.domain.models import (
     OperatorAction,
     OperatorCommand,
     OperatorCommandOutcome,
+    InstrumentId,
     PermitScope,
     SafetyState,
-    UnknownResolutionEvidence,
-    UnknownResolutionResult,
+    ReservationTerms,
+    Side,
 )
 from trader.ports.ledger import (
     LedgerEvent,
     LedgerPersistenceError,
     OperatorCommandConflict,
     PermitAlreadyConsumed,
+    ReservationCapacityExceeded,
 )
+from trader.ports.broker import BrokerEnvironment
 
 NOW = datetime(2026, 8, 25, 4, tzinfo=timezone.utc)
+
+
+def confirmed_absent(
+    observed_at=NOW,
+    account_id="acct",
+    environment=BrokerEnvironment.SIMULATED,
+):
+    return ConfirmedAbsent(ResolutionQueryEvidence(
+        environment, account_id, date(2026, 8, 25),
+        observed_at, observed_at, "unknown-resolution-v1", ("broker.orders.read",),
+        ("broker.orders.read",), True, ("observation-1",), "a" * 64, (), observed_at,
+    ))
+
+
+def current_order_payload(
+    permit_id="test-permit",
+    environment=BrokerEnvironment.SIMULATED,
+):
+    return {
+        "environment": environment.value,
+        "request": {
+            "account_id": "acct",
+            "instrument": {"market": "NASDAQ", "symbol": "AAPL", "currency": "USD"},
+            "side": "BUY", "quantity": "2",
+        },
+        "risk": {
+            "input_snapshot_environment": environment.value,
+            "input_snapshot_id": "snap",
+            "policy_version": "policy-v1",
+        },
+        "plan": {
+            "pricing_policy_version": "policy-v1",
+            "minimum_limit_price": "99",
+            "maximum_limit_price": "101",
+            "market_evidence": {
+                "snapshot_id": "market",
+                "environment": environment.value,
+                "observed_at": NOW.isoformat(),
+                "quality": "CONSISTENT",
+                "pricing_policy_version": "policy-v1",
+                "minimum_limit_price": "99",
+                "maximum_limit_price": "101",
+            },
+        },
+        "permit": {
+            "permit_id": permit_id,
+            "environment": environment.value,
+            "market_snapshot_id": "market",
+            "policy_version": "policy-v1",
+        },
+    }
 
 
 def command(safety, action=OperatorAction.HALT, command_id="command-1", **changes):
@@ -58,13 +123,38 @@ def command(safety, action=OperatorAction.HALT, command_id="command-1", **change
         "expires_at": NOW + timedelta(minutes=1),
         "action": action,
         "account_id": "acct",
+        "environment": safety.environment,
     }
     values.update(changes)
     return OperatorCommand(**values)
 
 
 def reserve_started(ledger, client_order_id, canonical_payload, prefix="submission"):
+    supplied = dict(canonical_payload)
+    supplied_permit = supplied.get("permit")
+    default_permit_id = (
+        supplied_permit.get("permit_id")
+        if isinstance(supplied_permit, dict)
+        else f"{prefix}-permit"
+    )
+    canonical_payload = current_order_payload(default_permit_id)
+    canonical_payload.update(supplied)
+    request_payload = dict(current_order_payload(default_permit_id)["request"])
+    request_payload.update(canonical_payload.get("request", {}))
+    canonical_payload["request"] = request_payload
+    risk_payload = dict(current_order_payload(default_permit_id)["risk"])
+    risk_payload.update(canonical_payload.get("risk", {}))
+    canonical_payload["risk"] = risk_payload
+    canonical_payload.setdefault("environment", BrokerEnvironment.SIMULATED.value)
+    canonical_payload.setdefault("permit", {
+        "permit_id": f"{prefix}-permit",
+        "environment": canonical_payload["environment"],
+    })
     permit = canonical_payload.get("permit")
+    if isinstance(permit, dict):
+        permit = dict(permit)
+        permit.setdefault("environment", canonical_payload["environment"])
+        canonical_payload["permit"] = permit
     permit_id = None if permit is None else permit["permit_id"]
     return ledger.reserve_submission(
         client_order_id,
@@ -72,10 +162,40 @@ def reserve_started(ledger, client_order_id, canonical_payload, prefix="submissi
         LedgerEvent(f"{prefix}-prepared", "PREPARED", client_order_id, NOW, {}),
         LedgerEvent(f"{prefix}-started", "SUBMISSION_STARTED", client_order_id, NOW, {}),
         permit_id,
+        reservation_terms(
+            account_id=canonical_payload["request"]["account_id"],
+            environment=BrokerEnvironment(canonical_payload["environment"]),
+        ),
+    )
+
+
+def reservation_terms(
+    *,
+    account_id="acct",
+    capacity_minor=10_000_000,
+    environment=BrokerEnvironment.SIMULATED,
+):
+    return ReservationTerms(
+        account_id, "snap", environment, "policy-v1",
+        InstrumentId("NASDAQ", "AAPL", "USD"), Side.BUY, 2, "USD", "USD",
+        capacity_minor, 0, 1, capacity_minor, capacity_minor, 0,
+        20_000, 20_000, 0,
     )
 
 
 def downgrade_v7_objects(connection):
+    connection.execute("DROP TRIGGER risk_event_contract")
+    connection.execute("DROP INDEX risk_reserved_once")
+    connection.execute("DROP TRIGGER risk_reservations_no_update")
+    connection.execute("DROP TRIGGER risk_reservations_no_delete")
+    connection.execute("DROP TABLE risk_reservations")
+    connection.execute("DROP TRIGGER ledger_events_no_delete")
+    connection.execute(
+        "DELETE FROM ledger_events WHERE event_type IN ('RISK_RESERVED','RISK_RELEASED')"
+    )
+    connection.execute(LEGACY_STATEMENTS[3])
+    connection.execute("DROP TRIGGER order_environment_contract")
+    connection.execute("DROP TRIGGER operator_environment_contract")
     connection.execute("DROP TRIGGER submission_state_contract")
     connection.execute("DROP INDEX order_request_permit_once")
     connection.execute("DROP TRIGGER operator_terminal_contract")
@@ -85,12 +205,14 @@ def downgrade_v7_objects(connection):
     connection.execute("DROP TRIGGER operator_commands_no_update")
     connection.execute(
         """UPDATE operator_commands SET canonical_json = json_remove(canonical_json,
-           '$.client_order_id', '$.risk_decision_id', '$.execution_plan_id')"""
+           '$.client_order_id', '$.risk_decision_id', '$.execution_plan_id',
+           '$.environment')"""
     )
     connection.execute("DROP TRIGGER ledger_events_no_update")
     connection.execute(
         """UPDATE ledger_events SET payload_json = json_remove(payload_json,
-           '$.client_order_id', '$.risk_decision_id', '$.execution_plan_id')
+           '$.client_order_id', '$.risk_decision_id', '$.execution_plan_id',
+           '$.environment')
            WHERE event_type = 'OPERATOR_COMMAND_REQUESTED'"""
     )
     connection.execute(LEGACY_STATEMENTS[2])
@@ -98,8 +220,25 @@ def downgrade_v7_objects(connection):
         """CREATE TRIGGER operator_commands_no_update BEFORE UPDATE ON operator_commands BEGIN
            SELECT RAISE(ABORT, 'operator commands are immutable'); END"""
     )
+    connection.execute("DROP TRIGGER order_requests_no_update")
+    connection.execute(
+        """UPDATE order_requests SET canonical_json =
+           json_remove(canonical_json,
+             '$.environment', '$.permit.environment',
+             '$.risk.input_snapshot_environment',
+             '$.plan.market_evidence.environment',
+             '$.plan.market_evidence.pricing_policy_version',
+             '$.plan.market_evidence.minimum_limit_price',
+             '$.plan.market_evidence.maximum_limit_price')"""
+    )
+    connection.execute(LEGACY_STATEMENTS[4])
     connection.execute("DROP TRIGGER schema_metadata_no_delete")
-    connection.execute("DELETE FROM schema_metadata WHERE key = 'operator_binding_v7_cutoff'")
+    connection.execute(
+        """DELETE FROM schema_metadata WHERE key IN (
+           'operator_binding_v7_cutoff', 'order_environment_v8_cutoff',
+           'operator_environment_v8_cutoff', 'risk_reservation_v9_order_cutoff',
+           'typed_resolution_v10_cutoff')"""
+    )
     connection.execute(
         """CREATE TRIGGER schema_metadata_no_delete BEFORE DELETE ON schema_metadata BEGIN
            SELECT RAISE(ABORT, 'schema metadata is immutable'); END"""
@@ -116,6 +255,15 @@ def downgrade_current_to_v2(path):
         connection.execute("DROP TRIGGER schema_metadata_no_delete")
         connection.execute("DROP TABLE schema_metadata")
         connection.execute("DROP TRIGGER ledger_events_no_update")
+        connection.execute(
+            """UPDATE ledger_events SET payload_json=json_object(
+                 'operator_command_id',json_extract(payload_json,'$.operator_command_id'),
+                 'result',json_extract(payload_json,'$.result'),
+                 'observation','grandfathered broker query',
+                 'reference','grandfathered-case',
+                 'observed_at',json_extract(payload_json,'$.query.fetched_at'))
+               WHERE event_type='SUBMITTED_UNKNOWN_RESOLVED'"""
+        )
         connection.execute(
             """UPDATE ledger_events SET payload_json =
                json_remove(payload_json, '$.related_permit_id', '$.related_order_id')
@@ -194,6 +342,36 @@ def downgrade_current_to_v6(path):
     try:
         downgrade_v7_objects(connection)
         connection.execute("PRAGMA user_version = 6")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def downgrade_current_to_v9(path):
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("DROP TRIGGER unknown_resolution_contract")
+        connection.execute("DROP TRIGGER ledger_events_no_update")
+        connection.execute(
+            """UPDATE ledger_events SET payload_json=json_object(
+                 'operator_command_id',json_extract(payload_json,'$.operator_command_id'),
+                 'result',json_extract(payload_json,'$.result'),
+                 'observation','grandfathered broker query',
+                 'reference','grandfathered-case',
+                 'observed_at',json_extract(payload_json,'$.query.fetched_at'))
+               WHERE event_type='SUBMITTED_UNKNOWN_RESOLVED'"""
+        )
+        connection.execute(LEGACY_STATEMENTS[2])
+        connection.execute(V7_STATEMENTS[5])
+        connection.execute("DROP TRIGGER schema_metadata_no_delete")
+        connection.execute(
+            "DELETE FROM schema_metadata WHERE key='typed_resolution_v10_cutoff'"
+        )
+        connection.execute(
+            """CREATE TRIGGER schema_metadata_no_delete BEFORE DELETE ON schema_metadata BEGIN
+               SELECT RAISE(ABORT, 'schema metadata is immutable'); END"""
+        )
+        connection.execute("PRAGMA user_version = 9")
         connection.commit()
     finally:
         connection.close()
@@ -285,14 +463,11 @@ class SchemaMigrationTests(unittest.TestCase):
 
     def test_reserve_submission_atomically_starts_and_consumes_permit_once(self):
         ledger = SQLiteLedger(self.path)
-        payload = {
-            "request": {"account_id": "acct"},
-            "permit": {"permit_id": "permit-1"},
-        }
+        payload = current_order_payload("permit-1")
         self.assertTrue(reserve_started(ledger, "order-1", payload, "order-1"))
         self.assertEqual(
             [event.event_type for event in ledger.events_for("order-1")],
-            ["PREPARED", "SUBMISSION_STARTED"],
+            ["RISK_RESERVED", "PREPARED", "SUBMISSION_STARTED"],
         )
         self.assertFalse(reserve_started(ledger, "order-1", payload, "duplicate"))
         with self.assertRaises(PermitAlreadyConsumed):
@@ -305,10 +480,7 @@ class SchemaMigrationTests(unittest.TestCase):
 
     def test_reserve_submission_rolls_back_order_permit_and_prepared_on_started_failure(self):
         ledger = SQLiteLedger(self.path)
-        payload = {
-            "request": {"account_id": "acct"},
-            "permit": {"permit_id": "rollback-permit"},
-        }
+        payload = current_order_payload("rollback-permit")
         duplicate_id = "same-event-id"
         with self.assertRaises(sqlite3.IntegrityError):
             ledger.reserve_submission(
@@ -319,6 +491,7 @@ class SchemaMigrationTests(unittest.TestCase):
                     duplicate_id, "SUBMISSION_STARTED", "rollback-order", NOW, {}
                 ),
                 "rollback-permit",
+                reservation_terms(),
             )
         self.assertEqual(ledger.events_for("rollback-order"), ())
         self.assertIsNone(ledger.connection.execute(
@@ -344,14 +517,15 @@ class SchemaMigrationTests(unittest.TestCase):
             raw_event("orphan-started", "SUBMISSION_STARTED", "orphan")
 
         ledger.connection.execute(
-            "INSERT INTO order_requests VALUES ('skipped-start','{}',?)", (NOW.isoformat(),)
+            "INSERT INTO order_requests VALUES ('skipped-start',?,?)",
+            (json.dumps(current_order_payload("skipped-permit")), NOW.isoformat()),
         )
         raw_event("skipped-prepared", "PREPARED", "skipped-start")
         with self.assertRaises(sqlite3.IntegrityError):
             raw_event("skipped-ack", "ACKNOWLEDGED", "skipped-start")
 
         reserve_started(
-            ledger, "terminal-order", {"request": {"account_id": "acct"}}, "terminal"
+            ledger, "terminal-order", current_order_payload(), "terminal"
         )
         raw_event("terminal-audit", "AUDIT_NOTE", "terminal-order")
         raw_event("terminal-ack", "ACKNOWLEDGED", "terminal-order")
@@ -363,7 +537,7 @@ class SchemaMigrationTests(unittest.TestCase):
 
     def test_permit_expression_index_rejects_direct_sql_reuse(self):
         ledger = SQLiteLedger(self.path)
-        canonical = json.dumps({"permit": {"permit_id": "raw-permit"}})
+        canonical = json.dumps(current_order_payload("raw-permit"))
         ledger.connection.execute(
             "INSERT INTO order_requests VALUES ('raw-order-1',?,?)",
             (canonical, NOW.isoformat()),
@@ -374,6 +548,45 @@ class SchemaMigrationTests(unittest.TestCase):
                 (canonical, NOW.isoformat()),
             )
         ledger.close()
+
+    def test_v8_rejects_missing_or_mismatched_evidence_contracts(self):
+        ledger = SQLiteLedger(self.path)
+        cases = []
+        missing_account_environment = current_order_payload("evidence-a")
+        del missing_account_environment["risk"]["input_snapshot_environment"]
+        cases.append(missing_account_environment)
+        wrong_market_environment = current_order_payload("evidence-b")
+        wrong_market_environment["plan"]["market_evidence"]["environment"] = "PAPER"
+        cases.append(wrong_market_environment)
+        wrong_policy = current_order_payload("evidence-c")
+        wrong_policy["plan"]["market_evidence"]["pricing_policy_version"] = "other"
+        cases.append(wrong_policy)
+        widened_band = current_order_payload("evidence-d")
+        widened_band["plan"]["market_evidence"]["maximum_limit_price"] = "102"
+        cases.append(widened_band)
+        for index, canonical in enumerate(cases):
+            with self.subTest(index=index), self.assertRaises(sqlite3.IntegrityError):
+                ledger.connection.execute(
+                    "INSERT INTO order_requests VALUES (?,?,?)",
+                    (f"evidence-{index}", json.dumps(canonical), NOW.isoformat()),
+                )
+        ledger.close()
+
+    def test_v8_reopen_rejects_tampered_authoritative_market_band(self):
+        ledger = SQLiteLedger(self.path)
+        reserve_started(
+            ledger, "tampered-band", current_order_payload("tampered-permit")
+        )
+        ledger.connection.execute("DROP TRIGGER order_requests_no_update")
+        ledger.connection.execute(
+            """UPDATE order_requests SET canonical_json = json_set(
+               canonical_json, '$.plan.market_evidence.maximum_limit_price', '102')
+               WHERE client_order_id = 'tampered-band'"""
+        )
+        ledger.connection.execute(LEGACY_STATEMENTS[4])
+        ledger.close()
+        with self.assertRaises(SchemaError):
+            SQLiteLedger(self.path)
 
     def test_v7_rejects_new_operator_audit_rows_using_grandfathered_shape(self):
         ledger = SQLiteLedger(self.path)
@@ -388,31 +601,20 @@ class SchemaMigrationTests(unittest.TestCase):
             "action": "HALT",
             "account_id": None,
         }
-        ledger.connection.execute(
-            "INSERT INTO operator_commands VALUES (?,?,?)",
-            ("legacy-shape", json.dumps(legacy), NOW.isoformat()),
-        )
-        ledger.connection.execute(
-            """INSERT INTO ledger_events
-               (event_id,event_type,aggregate_id,occurred_at,recorded_at,payload_json)
-               VALUES ('legacy-requested','OPERATOR_COMMAND_REQUESTED','legacy-shape',?,?,?)""",
-            (
-                NOW.isoformat(),
-                NOW.isoformat(),
-                json.dumps({**legacy, "previous_state": "BOOTSTRAPPING"}),
-            ),
-        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            ledger.connection.execute(
+                "INSERT INTO operator_commands VALUES (?,?,?)",
+                ("legacy-shape", json.dumps(legacy), NOW.isoformat()),
+            )
         ledger.close()
-        with self.assertRaises(SchemaError):
-            SQLiteLedger(self.path)
 
     def test_v6_valid_history_migrates_and_enforces_v7_contracts(self):
         ledger = SQLiteLedger(self.path)
-        reserve_started(ledger, "legacy-valid", {"request": {"account_id": "acct"}})
+        reserve_started(ledger, "legacy-valid", current_order_payload())
         ledger.close()
         downgrade_current_to_v6(self.path)
         migrated = SQLiteLedger(self.path)
-        self.assertEqual(migrated.schema_version, 7)
+        self.assertEqual(migrated.schema_version, SCHEMA_VERSION)
         with self.assertRaises(sqlite3.IntegrityError):
             migrated.append(
                 LedgerEvent("legacy-second-start", "SUBMISSION_STARTED", "legacy-valid", NOW, {})
@@ -497,7 +699,7 @@ class SchemaMigrationTests(unittest.TestCase):
 
     def test_interleaved_non_submission_event_cannot_hide_incomplete_submit(self):
         ledger = SQLiteLedger(self.path)
-        reserve_started(ledger, "order", {"request": {"account_id": "acct"}}, "order")
+        reserve_started(ledger, "order", current_order_payload(), "order")
         ledger.append(LedgerEvent("audit", "AUDIT_NOTE", "order", NOW, {}))
         self.assertEqual(ledger.incomplete_submissions(), ("order",))
         ledger.append(LedgerEvent("ack", "ACKNOWLEDGED", "order", NOW, {}))
@@ -564,6 +766,51 @@ class SchemaMigrationTests(unittest.TestCase):
             ledger.unresolved_unknown_submissions("")
         ledger.close()
 
+    def test_recovery_queries_isolate_same_alias_by_environment(self):
+        ledger = SQLiteLedger(self.path)
+        for environment in (BrokerEnvironment.PAPER, BrokerEnvironment.LIVE):
+            prefix = environment.value.lower()
+            for state in ("pending", "unknown"):
+                order_id = f"{prefix}-{state}"
+                reserve_started(
+                    ledger,
+                    order_id,
+                    current_order_payload(
+                        f"{order_id}-permit", environment=environment
+                    ),
+                    order_id,
+                )
+                if state == "unknown":
+                    ledger.append(LedgerEvent(
+                        f"{order_id}-unknown",
+                        "SUBMITTED_UNKNOWN",
+                        order_id,
+                        NOW,
+                        {},
+                    ))
+
+        self.assertEqual(
+            ledger.incomplete_submissions("acct", BrokerEnvironment.PAPER),
+            ("paper-pending",),
+        )
+        self.assertEqual(
+            ledger.incomplete_submissions("acct", BrokerEnvironment.LIVE),
+            ("live-pending",),
+        )
+        self.assertEqual(
+            ledger.unresolved_unknown_submissions(
+                "acct", BrokerEnvironment.PAPER
+            ),
+            ("paper-unknown",),
+        )
+        self.assertEqual(
+            ledger.unresolved_unknown_submissions(
+                "acct", BrokerEnvironment.LIVE
+            ),
+            ("live-unknown",),
+        )
+        ledger.close()
+
     def test_known_v1_migrates_forward_to_current(self):
         ledger = SQLiteLedger(self.path)
         ledger.append(LedgerEvent("v1-data", "AUDIT", "a", NOW, {}))
@@ -611,7 +858,7 @@ class SchemaMigrationTests(unittest.TestCase):
 
     def test_known_v2_valid_audit_chain_migrates_to_v3(self):
         ledger = SQLiteLedger(self.path)
-        safety = SafetyController()
+        safety = SafetyController(BrokerEnvironment.SIMULATED)
         service = OperatorCommandService(
             ledger, safety, "deploy-v1", lambda: NOW, account_id="acct"
         )
@@ -628,7 +875,7 @@ class SchemaMigrationTests(unittest.TestCase):
 
     def test_v2_malformed_terminal_payload_fails_migration(self):
         ledger = SQLiteLedger(self.path)
-        safety = SafetyController()
+        safety = SafetyController(BrokerEnvironment.SIMULATED)
         pending = command(safety, command_id="bad-v2-terminal")
         ledger.reserve_operator_command(
             pending,
@@ -661,7 +908,7 @@ class SchemaMigrationTests(unittest.TestCase):
 
     def test_v2_terminal_before_requested_fails_migration(self):
         ledger = SQLiteLedger(self.path)
-        safety = SafetyController()
+        safety = SafetyController(BrokerEnvironment.SIMULATED)
         pending = command(safety, command_id="reordered-v2")
         ledger.close()
         downgrade_current_to_v2(self.path)
@@ -708,13 +955,14 @@ class SchemaMigrationTests(unittest.TestCase):
 
     def test_v2_malformed_unknown_resolution_fails_migration(self):
         ledger = SQLiteLedger(self.path)
-        safety = SafetyController()
+        safety = SafetyController(BrokerEnvironment.SIMULATED)
         ledger.reserve_submission(
             "unknown-order",
-            {"request": {"account_id": "acct"}},
+            current_order_payload(),
             LedgerEvent("prepared", "PREPARED", "unknown-order", NOW, {}),
             LedgerEvent("started", "SUBMISSION_STARTED", "unknown-order", NOW, {}),
-            None,
+            "test-permit",
+            reservation_terms(),
         )
         ledger.append(
             LedgerEvent("unknown", "SUBMITTED_UNKNOWN", "unknown-order", NOW, {})
@@ -770,13 +1018,14 @@ class SchemaMigrationTests(unittest.TestCase):
 
     def test_valid_v2_unknown_resolution_chain_migrates_and_reopens(self):
         ledger = SQLiteLedger(self.path)
-        safety = SafetyController()
+        safety = SafetyController(BrokerEnvironment.SIMULATED)
         ledger.reserve_submission(
             "valid-unknown-order",
-            {"request": {"account_id": "acct"}},
+            current_order_payload(),
             LedgerEvent("valid-prepared", "PREPARED", "valid-unknown-order", NOW, {}),
             LedgerEvent("valid-started", "SUBMISSION_STARTED", "valid-unknown-order", NOW, {}),
-            None,
+            "test-permit",
+            reservation_terms(),
         )
         ledger.append(
             LedgerEvent(
@@ -796,12 +1045,7 @@ class SchemaMigrationTests(unittest.TestCase):
                 client_order_id="valid-unknown-order",
             ),
             "valid-unknown-order",
-            UnknownResolutionEvidence(
-                UnknownResolutionResult.CONFIRMED_ABSENT,
-                "broker inquiry",
-                "case-valid",
-                NOW,
-            ),
+            confirmed_absent(),
         )
         ledger.close()
         downgrade_current_to_v2(self.path)
@@ -812,9 +1056,47 @@ class SchemaMigrationTests(unittest.TestCase):
         self.assertEqual(reopened.schema_version, SCHEMA_VERSION)
         reopened.close()
 
+    def test_v9_legacy_free_text_resolution_is_grandfathered_on_v10_migration(self):
+        ledger = SQLiteLedger(self.path)
+        safety = SafetyController(BrokerEnvironment.SIMULATED)
+        order_id = "v9-legacy-resolution"
+        ledger.reserve_submission(
+            order_id, current_order_payload(),
+            LedgerEvent("v9-prepared", "PREPARED", order_id, NOW, {}),
+            LedgerEvent("v9-started", "SUBMISSION_STARTED", order_id, NOW, {}),
+            "test-permit", reservation_terms(),
+        )
+        ledger.append(LedgerEvent("v9-unknown", "SUBMITTED_UNKNOWN", order_id, NOW, {}))
+        safety.block_unknown_submission(order_id)
+        OperatorCommandService(
+            ledger, safety, "deploy-v1", lambda: NOW, account_id="acct",
+        ).resolve_unknown_submission(
+            command(
+                safety, OperatorAction.RESOLVE_SUBMITTED_UNKNOWN,
+                "v9-resolution-command", account_id="acct", client_order_id=order_id,
+            ),
+            order_id,
+            confirmed_absent(),
+        )
+        ledger.close()
+        downgrade_current_to_v9(self.path)
+
+        migrated = SQLiteLedger(self.path)
+        self.assertEqual(migrated.schema_version, SCHEMA_VERSION)
+        self.assertEqual(migrated.unresolved_unknown_submissions(), ())
+        resolution = next(
+            event for event in migrated.events_for(order_id)
+            if event.event_type == "SUBMITTED_UNKNOWN_RESOLVED"
+        )
+        self.assertEqual(
+            set(resolution.payload),
+            {"operator_command_id", "result", "observation", "reference", "observed_at"},
+        )
+        migrated.close()
+
     def test_known_v3_valid_chain_migrates_to_v4(self):
         ledger = SQLiteLedger(self.path)
-        safety = SafetyController()
+        safety = SafetyController(BrokerEnvironment.SIMULATED)
         service = OperatorCommandService(
             ledger, safety, "deploy-v1", lambda: NOW, account_id="acct"
         )
@@ -827,7 +1109,7 @@ class SchemaMigrationTests(unittest.TestCase):
 
     def test_known_v4_terminal_is_grandfathered_without_ledger_update(self):
         ledger = SQLiteLedger(self.path)
-        safety = SafetyController()
+        safety = SafetyController(BrokerEnvironment.SIMULATED)
         service = OperatorCommandService(
             ledger, safety, "deploy-v1", lambda: NOW, account_id="acct"
         )
@@ -856,7 +1138,7 @@ class SchemaMigrationTests(unittest.TestCase):
 
     def test_v3_duplicate_terminal_keys_fail_migration(self):
         ledger = SQLiteLedger(self.path)
-        safety = SafetyController()
+        safety = SafetyController(BrokerEnvironment.SIMULATED)
         pending = command(safety, command_id="duplicate-v3-terminal")
         ledger.reserve_operator_command(
             pending,
@@ -894,13 +1176,14 @@ class SchemaMigrationTests(unittest.TestCase):
 
     def test_v3_duplicate_resolution_keys_fail_migration(self):
         ledger = SQLiteLedger(self.path)
-        safety = SafetyController()
+        safety = SafetyController(BrokerEnvironment.SIMULATED)
         ledger.reserve_submission(
             "duplicate-v3-order",
-            {"request": {"account_id": "acct"}},
+            current_order_payload(),
             LedgerEvent("duplicate-prepared", "PREPARED", "duplicate-v3-order", NOW, {}),
             LedgerEvent("duplicate-started", "SUBMISSION_STARTED", "duplicate-v3-order", NOW, {}),
-            None,
+            "test-permit",
+            reservation_terms(),
         )
         ledger.append(
             LedgerEvent(
@@ -977,14 +1260,15 @@ class SchemaMigrationTests(unittest.TestCase):
             SQLiteLedger(self.path)
 
     def test_v5_future_unknown_evidence_fails_closed_during_migration(self):
-        safety = SafetyController()
+        safety = SafetyController(BrokerEnvironment.SIMULATED)
         ledger = SQLiteLedger(self.path)
         ledger.reserve_submission(
             "future-v5-order",
-            {"request": {"account_id": "acct"}},
+            current_order_payload(),
             LedgerEvent("future-v5-prepared", "PREPARED", "future-v5-order", NOW, {}),
             LedgerEvent("future-v5-started", "SUBMISSION_STARTED", "future-v5-order", NOW, {}),
-            None,
+            "test-permit",
+            reservation_terms(),
         )
         ledger.append(
             LedgerEvent("future-v5-unknown", "SUBMITTED_UNKNOWN", "future-v5-order", NOW, {})
@@ -1041,7 +1325,7 @@ class OperatorBoundaryTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.path = Path(self.temp.name) / "ledger.db"
         self.ledger = SQLiteLedger(self.path)
-        self.safety = SafetyController()
+        self.safety = SafetyController(BrokerEnvironment.SIMULATED)
 
     def tearDown(self):
         self.ledger.close()
@@ -1055,6 +1339,232 @@ class OperatorBoundaryTests(unittest.TestCase):
             lambda: NOW,
             account_id="acct",
         )
+
+    def _unknown(self, order_id):
+        self.ledger.reserve_submission(
+            order_id, current_order_payload(f"{order_id}-permit"),
+            LedgerEvent(f"{order_id}-prepared", "PREPARED", order_id, NOW, {}),
+            LedgerEvent(f"{order_id}-started", "SUBMISSION_STARTED", order_id, NOW, {}),
+            f"{order_id}-permit", reservation_terms(),
+        )
+        self.ledger.append(LedgerEvent(
+            f"{order_id}-unknown", "SUBMITTED_UNKNOWN", order_id, NOW, {},
+        ))
+        self.safety.block_unknown_submission(order_id)
+
+    def test_typed_resolution_variants_persist_exact_payload_and_release_only_absent(self):
+        ref = BrokerOrderRef(
+            BrokerEnvironment.SIMULATED, "acct", date(2026, 8, 25), "broker-1",
+        )
+        query_one = ResolutionQueryEvidence(
+            BrokerEnvironment.SIMULATED, "acct", date(2026, 8, 25), NOW, NOW,
+            "unknown-resolution-v1", ("broker.orders.read",),
+            ("broker.orders.read",), True,
+            ("observation-1",), "a" * 64, (ref,), NOW,
+        )
+        variants = {
+            "absent": confirmed_absent(),
+            "linked": BrokerOrderLinked(ref, "broker.orders.read", query_one),
+            "manual": ManualActivityLinked(ref, "manual-1", "operator", NOW, query_one),
+        }
+        for name, evidence in variants.items():
+            with self.subTest(name=name):
+                order_id = f"typed-{name}"
+                self._unknown(order_id)
+                resolution = command(
+                    self.safety, OperatorAction.RESOLVE_SUBMITTED_UNKNOWN,
+                    f"resolve-{name}", account_id="acct", client_order_id=order_id,
+                )
+                self.service().resolve_unknown_submission(resolution, order_id, evidence)
+                events = self.ledger.events_for(order_id)
+                stored = next(
+                    event for event in events
+                    if event.event_type == "SUBMITTED_UNKNOWN_RESOLVED"
+                )
+                self.assertEqual(
+                    dict(stored.payload),
+                    canonical_resolution_payload(resolution.command_id, evidence),
+                )
+                self.assertEqual(
+                    "RISK_RELEASED" in [event.event_type for event in events],
+                    name == "absent",
+                )
+                self.assertNotIn(f"SUBMITTED_UNKNOWN:{order_id}", self.safety.blockers)
+
+    def test_unknown_resolution_requires_order_command_and_evidence_environment(self):
+        order_id = "paper-order-live-resolution"
+        self.ledger.reserve_submission(
+            order_id,
+            current_order_payload(
+                f"{order_id}-permit", environment=BrokerEnvironment.PAPER
+            ),
+            LedgerEvent(f"{order_id}-prepared", "PREPARED", order_id, NOW, {}),
+            LedgerEvent(
+                f"{order_id}-started", "SUBMISSION_STARTED", order_id, NOW, {}
+            ),
+            f"{order_id}-permit",
+            reservation_terms(environment=BrokerEnvironment.PAPER),
+        )
+        self.ledger.append(LedgerEvent(
+            f"{order_id}-unknown", "SUBMITTED_UNKNOWN", order_id, NOW, {}
+        ))
+        live_safety = SafetyController(BrokerEnvironment.LIVE)
+        resolution = command(
+            live_safety,
+            OperatorAction.RESOLVE_SUBMITTED_UNKNOWN,
+            "live-resolution-command",
+            client_order_id=order_id,
+        )
+        self.ledger.reserve_operator_command(
+            resolution,
+            LedgerEvent(
+                "live-resolution-requested",
+                "OPERATOR_COMMAND_REQUESTED",
+                resolution.command_id,
+                NOW,
+                {
+                    **self.ledger.canonical_command(resolution),
+                    "previous_state": live_safety.state.value,
+                },
+            ),
+        )
+        evidence = confirmed_absent(environment=BrokerEnvironment.LIVE)
+        event = LedgerEvent(
+            "live-resolution",
+            "SUBMITTED_UNKNOWN_RESOLVED",
+            order_id,
+            NOW,
+            canonical_resolution_payload(resolution.command_id, evidence),
+        )
+
+        with self.assertRaises(ValueError):
+            self.ledger.record_unknown_resolution(
+                order_id, resolution, evidence, event
+            )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.ledger.connection.execute(
+                """INSERT INTO ledger_events
+                   (event_id,event_type,aggregate_id,occurred_at,recorded_at,payload_json)
+                   VALUES (?,?,?,?,?,?)""",
+                (
+                    event.event_id,
+                    event.event_type,
+                    event.aggregate_id,
+                    event.occurred_at.isoformat(),
+                    NOW.isoformat(),
+                    json.dumps(event.payload),
+                ),
+            )
+
+        self.ledger.connection.execute("DROP TRIGGER unknown_resolution_contract")
+        self.ledger.connection.execute(
+            """INSERT INTO ledger_events
+               (event_id,event_type,aggregate_id,occurred_at,recorded_at,payload_json)
+               VALUES (?,?,?,?,?,?)""",
+            (
+                event.event_id,
+                event.event_type,
+                event.aggregate_id,
+                event.occurred_at.isoformat(),
+                NOW.isoformat(),
+                json.dumps(event.payload),
+            ),
+        )
+        self.ledger.connection.execute(V10_RESOLUTION_SQL)
+        self.ledger.close()
+        with self.assertRaises(SchemaError):
+            SQLiteLedger(self.path)
+
+    def test_resolution_release_fault_rolls_back_resolution_and_release(self):
+        order_id = "resolution-rollback"
+        self._unknown(order_id)
+        resolution = command(
+            self.safety, OperatorAction.RESOLVE_SUBMITTED_UNKNOWN,
+            "resolution-rollback-command", account_id="acct", client_order_id=order_id,
+        )
+        service = self.service()
+        original = self.ledger._insert_full_release
+
+        def fail_release(*unused):
+            raise sqlite3.OperationalError("fault injection")
+
+        self.ledger._insert_full_release = fail_release
+        try:
+            with self.assertRaises(OperatorPersistenceFailure):
+                service.resolve_unknown_submission(
+                    resolution, order_id, confirmed_absent(),
+                )
+        finally:
+            self.ledger._insert_full_release = original
+        self.assertEqual(self.ledger.unresolved_unknown_submissions(), (order_id,))
+        self.assertNotIn(
+            "SUBMITTED_UNKNOWN_RESOLVED",
+            [event.event_type for event in self.ledger.events_for(order_id)],
+        )
+        self.assertIn(f"SUBMITTED_UNKNOWN:{order_id}", self.safety.blockers)
+
+    def test_direct_sql_cannot_misclassify_one_candidate_as_absent(self):
+        order_id = "direct-sql-candidate"
+        self._unknown(order_id)
+        resolution = command(
+            self.safety, OperatorAction.RESOLVE_SUBMITTED_UNKNOWN,
+            "direct-sql-command", account_id="acct", client_order_id=order_id,
+        )
+        self.ledger.reserve_operator_command(
+            resolution,
+            LedgerEvent(
+                "direct-sql-requested", "OPERATOR_COMMAND_REQUESTED",
+                resolution.command_id, NOW,
+                {
+                    **self.ledger.canonical_command(resolution),
+                    "previous_state": self.safety.state.value,
+                },
+            ),
+        )
+        payload = canonical_resolution_payload(
+            resolution.command_id, confirmed_absent(),
+        )
+        payload["query"]["candidate_count"] = 1
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.ledger.connection.execute(
+                """INSERT INTO ledger_events
+                   (event_id,event_type,aggregate_id,occurred_at,recorded_at,payload_json)
+                   VALUES ('direct-sql-resolution','SUBMITTED_UNKNOWN_RESOLVED',?,?,?,?)""",
+                (order_id, NOW.isoformat(), NOW.isoformat(), json.dumps(payload)),
+            )
+        ref = BrokerOrderRef(
+            BrokerEnvironment.SIMULATED, "acct", date(2026, 8, 25), "candidate-1",
+        )
+        query = ResolutionQueryEvidence(
+            BrokerEnvironment.SIMULATED, "acct", date(2026, 8, 25), NOW, NOW,
+            "unknown-resolution-v1", ("broker.orders.read",),
+            ("broker.orders.read",), True, ("observation-1",), "a" * 64, (ref,), NOW,
+        )
+        payload = canonical_resolution_payload(
+            resolution.command_id,
+            BrokerOrderLinked(ref, "broker.orders.read", query),
+        )
+        payload["broker_order_ref"]["broker_order_id"] = "not-the-candidate"
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.ledger.connection.execute(
+                """INSERT INTO ledger_events
+                   (event_id,event_type,aggregate_id,occurred_at,recorded_at,payload_json)
+                   VALUES ('direct-sql-membership','SUBMITTED_UNKNOWN_RESOLVED',?,?,?,?)""",
+                (order_id, NOW.isoformat(), NOW.isoformat(), json.dumps(payload)),
+            )
+        payload = canonical_resolution_payload(
+            resolution.command_id, confirmed_absent(),
+        )
+        payload["query"]["candidate_set_sha256"] = "0" * 64
+        self.ledger.connection.execute(
+            """INSERT INTO ledger_events
+               (event_id,event_type,aggregate_id,occurred_at,recorded_at,payload_json)
+               VALUES ('direct-sql-hash','SUBMITTED_UNKNOWN_RESOLVED',?,?,?,?)""",
+            (order_id, NOW.isoformat(), NOW.isoformat(), json.dumps(payload)),
+        )
+        self.ledger.close()
+        with self.assertRaises(SchemaError):
+            SQLiteLedger(self.path)
 
     def test_requested_is_committed_before_effect_and_terminal_after(self):
         service = self.service()
@@ -1188,7 +1698,7 @@ class OperatorBoundaryTests(unittest.TestCase):
                 requested_payload,
             ),
         )
-        restarted = SafetyController()
+        restarted = SafetyController(BrokerEnvironment.SIMULATED)
         self.service(safety=restarted)
         self.assertEqual(restarted.state, SafetyState.HALTED)
         self.assertIn("PENDING_OPERATOR_COMMAND:command-1", restarted.blockers)
@@ -1417,10 +1927,11 @@ class OperatorBoundaryTests(unittest.TestCase):
     def test_raw_resolution_with_valid_chain_but_empty_evidence_is_rejected(self):
         self.ledger.reserve_submission(
             "raw-unknown-order",
-            {"request": {"account_id": "acct"}},
+            current_order_payload(),
             LedgerEvent("raw-prepared", "PREPARED", "raw-unknown-order", NOW, {}),
             LedgerEvent("raw-started", "SUBMISSION_STARTED", "raw-unknown-order", NOW, {}),
-            None,
+            "test-permit",
+            reservation_terms(),
         )
         self.ledger.append(
             LedgerEvent("raw-unknown", "SUBMITTED_UNKNOWN", "raw-unknown-order", NOW, {})
@@ -1470,10 +1981,11 @@ class OperatorBoundaryTests(unittest.TestCase):
         client_order_id = "target-order"
         self.ledger.reserve_submission(
             client_order_id,
-            {"request": {"account_id": "acct"}},
+            current_order_payload(),
             LedgerEvent("target-prepared", "PREPARED", client_order_id, NOW, {}),
             LedgerEvent("target-started", "SUBMISSION_STARTED", client_order_id, NOW, {}),
-            None,
+            "test-permit",
+            reservation_terms(),
         )
         self.ledger.append(
             LedgerEvent("target-unknown", "SUBMITTED_UNKNOWN", client_order_id, NOW, {})
@@ -1498,19 +2010,8 @@ class OperatorBoundaryTests(unittest.TestCase):
                 },
             ),
         )
-        evidence = UnknownResolutionEvidence(
-            UnknownResolutionResult.CONFIRMED_ABSENT,
-            "broker inquiry",
-            "wrong-target-case",
-            NOW,
-        )
-        payload = {
-            "operator_command_id": resolution.command_id,
-            "result": evidence.result.value,
-            "observation": evidence.observation,
-            "reference": evidence.reference,
-            "observed_at": evidence.observed_at.isoformat(),
-        }
+        evidence = confirmed_absent()
+        payload = canonical_resolution_payload(resolution.command_id, evidence)
         event = LedgerEvent(
             "wrong-target-resolution",
             "SUBMITTED_UNKNOWN_RESOLVED",
@@ -1552,10 +2053,11 @@ class OperatorBoundaryTests(unittest.TestCase):
         client_order_id = "terminal-target"
         self.ledger.reserve_submission(
             client_order_id,
-            {"request": {"account_id": "acct"}},
+            current_order_payload(),
             LedgerEvent("terminal-prepared", "PREPARED", client_order_id, NOW, {}),
             LedgerEvent("terminal-started", "SUBMISSION_STARTED", client_order_id, NOW, {}),
-            None,
+            "test-permit",
+            reservation_terms(),
         )
         self.ledger.append(
             LedgerEvent("terminal-unknown", "SUBMITTED_UNKNOWN", client_order_id, NOW, {})
@@ -1655,24 +2157,13 @@ class OperatorBoundaryTests(unittest.TestCase):
             )
 
         correct = reserve_resolution("correct-terminal", client_order_id)
-        evidence = UnknownResolutionEvidence(
-            UnknownResolutionResult.CONFIRMED_ABSENT,
-            "broker inquiry",
-            "correct-terminal-case",
-            NOW,
-        )
+        evidence = confirmed_absent()
         resolution_event = LedgerEvent(
             "correct-resolution",
             "SUBMITTED_UNKNOWN_RESOLVED",
             client_order_id,
             NOW,
-            {
-                "operator_command_id": correct.command_id,
-                "result": evidence.result.value,
-                "observation": evidence.observation,
-                "reference": evidence.reference,
-                "observed_at": evidence.observed_at.isoformat(),
-            },
+            canonical_resolution_payload(correct.command_id, evidence),
         )
         self.ledger.record_unknown_resolution(
             client_order_id, correct, evidence, resolution_event
@@ -1700,10 +2191,11 @@ class OperatorBoundaryTests(unittest.TestCase):
         client_order_id = "future-evidence-order"
         self.ledger.reserve_submission(
             client_order_id,
-            {"request": {"account_id": "acct"}},
+            current_order_payload(),
             LedgerEvent("future-prepared", "PREPARED", client_order_id, NOW, {}),
             LedgerEvent("future-started", "SUBMISSION_STARTED", client_order_id, NOW, {}),
-            None,
+            "test-permit",
+            reservation_terms(),
         )
         self.ledger.append(
             LedgerEvent("future-unknown", "SUBMITTED_UNKNOWN", client_order_id, NOW, {})
@@ -1728,19 +2220,8 @@ class OperatorBoundaryTests(unittest.TestCase):
                 },
             ),
         )
-        evidence = UnknownResolutionEvidence(
-            UnknownResolutionResult.CONFIRMED_ABSENT,
-            "future broker observation",
-            "case-future",
-            NOW + timedelta(seconds=1),
-        )
-        payload = {
-            "operator_command_id": resolution.command_id,
-            "result": evidence.result.value,
-            "observation": evidence.observation,
-            "reference": evidence.reference,
-            "observed_at": evidence.observed_at.isoformat(),
-        }
+        evidence = confirmed_absent(NOW + timedelta(seconds=1))
+        payload = canonical_resolution_payload(resolution.command_id, evidence)
         event = LedgerEvent(
             "future-resolution", "SUBMITTED_UNKNOWN_RESOLVED", client_order_id, NOW, payload
         )
@@ -1786,7 +2267,10 @@ class BackupRestoreTests(unittest.TestCase):
         restored = SQLiteLedger.restore(backup, self.root / "restored.db")
         self.assertEqual(restored.events_for("a")[0].event_id, "wal-event")
         self.assertTrue(restored.integrity_check())
-        self.assertEqual(SafetyController().state, SafetyState.BOOTSTRAPPING)
+        self.assertEqual(
+            SafetyController(BrokerEnvironment.SIMULATED).state,
+            SafetyState.BOOTSTRAPPING,
+        )
         restored.close()
 
     def test_v6_backup_is_verified_migrated_and_restored_as_current(self):
@@ -1804,6 +2288,21 @@ class BackupRestoreTests(unittest.TestCase):
         self.assertEqual(restored.schema_version, SCHEMA_VERSION)
         self.assertEqual(restored.events_for("a")[0].event_id, "v6-backup-event")
         self.assertTrue(restored.integrity_check())
+        restored.close()
+
+    def test_v9_backup_is_verified_migrated_and_restored_as_current(self):
+        self.ledger.append(LedgerEvent("v9-backup-event", "AUDIT", "a", NOW, {}))
+        backup = self.root / "v9-backup.db"
+        manifest_path = self.ledger.backup(backup, app_version="0.1.0")
+        downgrade_current_to_v9(backup)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["schema_version"] = 9
+        manifest["sha256"] = hashlib.sha256(backup.read_bytes()).hexdigest()
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        restored = SQLiteLedger.restore(backup, self.root / "v9-restored.db")
+        self.assertEqual(restored.schema_version, SCHEMA_VERSION)
+        self.assertEqual(restored.events_for("a")[0].event_id, "v9-backup-event")
         restored.close()
 
     def test_tampered_or_unsupported_legacy_backup_leaves_no_destination(self):
@@ -1996,6 +2495,106 @@ class BackupRestoreTests(unittest.TestCase):
         Path(f"{destination}-wal").touch()
         with self.assertRaises(FileExistsError):
             SQLiteLedger.restore(backup, destination)
+
+
+class RiskReservationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.path = Path(self.temp.name) / "risk.db"
+        ledger = SQLiteLedger(self.path)
+        ledger.close()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    @staticmethod
+    def _reserve(ledger, order_id, terms=None):
+        payload = current_order_payload(f"{order_id}-permit")
+        return ledger.reserve_submission(
+            order_id, payload,
+            LedgerEvent(f"{order_id}-prepared", "PREPARED", order_id, NOW, {}),
+            LedgerEvent(f"{order_id}-started", "SUBMISSION_STARTED", order_id, NOW, {}),
+            f"{order_id}-permit", terms or reservation_terms(),
+        )
+
+    def test_concurrent_account_capacity_admits_exactly_one(self):
+        barrier = threading.Barrier(2)
+        results = []
+
+        def compete(order_id):
+            ledger = SQLiteLedger(self.path)
+            try:
+                barrier.wait()
+                self._reserve(ledger, order_id, reservation_terms(capacity_minor=20_000))
+                results.append("reserved")
+            except ReservationCapacityExceeded:
+                results.append("blocked")
+            finally:
+                ledger.close()
+
+        threads = [threading.Thread(target=compete, args=(f"order-{index}",)) for index in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertCountEqual(results, ["reserved", "blocked"])
+
+    def test_rejection_releases_atomically_and_direct_tampering_fails(self):
+        ledger = SQLiteLedger(self.path)
+        try:
+            valid_release = json.dumps({
+                "reserved_cash_minor": 20_000,
+                "reserved_exposure_minor": 20_000,
+                "reserved_sell_quantity": 0,
+            })
+            with self.assertRaises(sqlite3.IntegrityError):
+                ledger.connection.execute(
+                    """INSERT INTO ledger_events
+                       (event_id,event_type,aggregate_id,occurred_at,recorded_at,payload_json)
+                       VALUES ('before-reserve','RISK_RELEASED','missing',?,?,?)""",
+                    (NOW.isoformat(), NOW.isoformat(), valid_release),
+                )
+            self._reserve(ledger, "first")
+            with self.assertRaises(sqlite3.IntegrityError):
+                ledger.connection.execute(
+                    "UPDATE risk_reservations SET reserved_cash_minor=0 WHERE client_order_id='first'"
+                )
+            with self.assertRaises(sqlite3.IntegrityError):
+                ledger.connection.execute(
+                    """INSERT INTO ledger_events
+                       (event_id,event_type,aggregate_id,occurred_at,recorded_at,payload_json)
+                       VALUES ('negative','RISK_RELEASED','first',?,?,?)""",
+                    (NOW.isoformat(), NOW.isoformat(), json.dumps({
+                        "reserved_cash_minor": -1,
+                        "reserved_exposure_minor": 0,
+                        "reserved_sell_quantity": 0,
+                    })),
+                )
+            with self.assertRaises(sqlite3.IntegrityError):
+                ledger.connection.execute(
+                    """INSERT INTO ledger_events
+                       (event_id,event_type,aggregate_id,occurred_at,recorded_at,payload_json)
+                       VALUES ('before-terminal','RISK_RELEASED','first',?,?,?)""",
+                    (NOW.isoformat(), NOW.isoformat(), valid_release),
+                )
+            ledger.complete_submission(LedgerEvent(
+                "first-rejected", "SUBMISSION_REJECTED", "first", NOW,
+                {"broker_order_id": None, "detail_code": "REJECTED"},
+            ))
+            self.assertEqual(
+                [event.event_type for event in ledger.events_for("first")][-2:],
+                ["SUBMISSION_REJECTED", "RISK_RELEASED"],
+            )
+            self.assertTrue(self._reserve(ledger, "second"))
+            with self.assertRaises(sqlite3.IntegrityError):
+                ledger.connection.execute(
+                    """INSERT INTO ledger_events
+                       (event_id,event_type,aggregate_id,occurred_at,recorded_at,payload_json)
+                       VALUES ('duplicate-release','RISK_RELEASED','first',?,?,?)""",
+                    (NOW.isoformat(), NOW.isoformat(), valid_release),
+                )
+        finally:
+            ledger.close()
 
 
 if __name__ == "__main__":

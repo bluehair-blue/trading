@@ -1,10 +1,12 @@
 import ast
 from dataclasses import replace
+import json
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from importlib.util import resolve_name
 from pathlib import Path
@@ -24,6 +26,7 @@ from trader.application.operator import (
     OperatorPersistenceFailure,
 )
 from trader.application.safety import InvalidPermit, SafetyController, SafetyGuardError
+from trader.domain.broker_observations import ConfirmedAbsent, ResolutionQueryEvidence
 from trader.domain.models import (
     AccountSnapshot,
     BrokerExecutionState,
@@ -39,9 +42,13 @@ from trader.domain.models import (
     PendingAction,
     PermitScope,
     PositionTarget,
+    ReservationAccountState,
+    ReservationPosition,
+    ReservationTerms,
     RiskDecision,
     RiskOutcome,
     RiskStage,
+    RiskReservationPolicy,
     SafetyState,
     Side,
     SnapshotQuality,
@@ -49,8 +56,6 @@ from trader.domain.models import (
     TargetUnit,
     TimeInForce,
     TradeIntent,
-    UnknownResolutionEvidence,
-    UnknownResolutionResult,
 )
 from trader.domain.risk import continuous_disarm, eligibility, pre_trade_quantity_cap
 from trader.ports.broker import (
@@ -64,10 +69,20 @@ from trader.ports.ledger import (
     OrderReservationConflict,
     PermitAlreadyConsumed,
 )
+from trader.ports.clock import PROCESS_CLOCK_SESSION_ID
 
 
 NOW = datetime(2026, 8, 25, 3, tzinfo=timezone.utc)
+MONOTONIC_NOW = time.monotonic()
 _TEST_LEDGERS = []
+
+
+def confirmed_absent(observed_at=NOW, account_id="acct"):
+    return ConfirmedAbsent(ResolutionQueryEvidence(
+        BrokerEnvironment.SIMULATED, account_id, date(2026, 8, 25),
+        observed_at, observed_at, "unknown-resolution-v1", ("broker.orders.read",),
+        ("broker.orders.read",), True, ("observation-1",), "a" * 64, (), observed_at,
+    ))
 
 
 def tearDownModule():
@@ -75,13 +90,29 @@ def tearDownModule():
         ledger.close()
 
 
-def snapshot(quality=SnapshotQuality.CONSISTENT, observed_at=NOW):
+def snapshot(
+    quality=SnapshotQuality.CONSISTENT,
+    observed_at=NOW,
+    environment=BrokerEnvironment.SIMULATED,
+):
     observed = ObservedAmount(Decimal("1"), "obs", observed_at)
-    return AccountSnapshot("snap", "acct", quality, *(observed,) * 6, observed_at)
+    return AccountSnapshot(
+        "snap", "acct", environment, quality, *(observed,) * 6, observed_at
+    )
 
 
-def market(quality=SnapshotQuality.CONSISTENT, observed_at=NOW):
-    return MarketEvidence("market", quality, observed_at)
+def market(
+    quality=SnapshotQuality.CONSISTENT,
+    observed_at=NOW,
+    environment=BrokerEnvironment.SIMULATED,
+    pricing_policy_version="policy-v1",
+    minimum_limit_price=Decimal("99"),
+    maximum_limit_price=Decimal("101"),
+):
+    return MarketEvidence(
+        "market", environment, quality, observed_at, pricing_policy_version,
+        minimum_limit_price, maximum_limit_price,
+    )
 
 
 def intent(quantity=Decimal("2"), current=None):
@@ -99,15 +130,18 @@ def risk(quantity=Decimal("2"), outcome=RiskOutcome.APPROVED, snapshot_id="snap"
     approved = Decimal(0) if outcome is RiskOutcome.REJECTED else quantity
     return RiskDecision(
         "risk", RiskStage.PRE_TRADE, "policy-v1", snapshot_id, "intent", quantity, approved,
-        outcome, (), NOW,
+        outcome, (() if outcome is RiskOutcome.APPROVED else ("RISK_REJECTED",)), NOW,
     )
 
 
 def plan(quantity=Decimal("2"), expires_at=NOW + timedelta(minutes=1), price=Decimal("100.25")):
     side = Side.BUY if quantity > 0 else Side.SELL
+    created_at = min(NOW, expires_at - timedelta(seconds=1))
     return ExecutionPlan(
         "plan", "intent", "risk", side, OrderType.LIMIT, TimeInForce.DAY,
-        abs(quantity), price, expires_at,
+        abs(quantity), price, market(), "policy-v1", created_at, expires_at,
+        Decimal("99"), Decimal("101"), PROCESS_CLOCK_SESSION_ID,
+        MONOTONIC_NOW, MONOTONIC_NOW + max(1, (expires_at - created_at).total_seconds()),
     )
 
 
@@ -138,12 +172,113 @@ def new_order_permit(
     )
 
 
+def submit(service, request_value, risk_value, plan_value, intent_value, permit=None):
+    if plan_value.market_evidence.environment is not service.broker.environment:
+        plan_value = replace(
+            plan_value,
+            market_evidence=market(environment=service.broker.environment),
+        )
+    if permit is None:
+        permit = new_order_permit(
+            service.safety,
+            order_id=request_value.client_order_id,
+            risk_id=risk_value.decision_id,
+            plan_id=plan_value.plan_id,
+        )
+    return service.submit(request_value, risk_value, plan_value, intent_value, permit)
+
+
+def reservation_account_state(
+    snapshot_value=None, *, available_cash_minor=10_000_000,
+    current_exposure_minor=0, position_quantity=5, positions=None,
+):
+    snapshot_value = snapshot() if snapshot_value is None else snapshot_value
+    if positions is None:
+        positions = (
+            ReservationPosition(InstrumentId("NASDAQ", "AAPL", "USD"), position_quantity),
+        )
+    return ReservationAccountState(
+        snapshot_value.account_id, snapshot_value.snapshot_id, "USD",
+        available_cash_minor, current_exposure_minor, positions,
+    )
+
+
+def reservation_policy(
+    *, policy_version="policy-v1", cash_cap_minor=10_000_000,
+    exposure_cap_minor=10_000_000, fee_buffer_minor=0,
+):
+    return RiskReservationPolicy(
+        policy_version, cash_cap_minor, exposure_cap_minor, fee_buffer_minor
+    )
+
+
+def reservation_terms(
+    order=None, intent_value=None, *, account_id=None,
+    environment=BrokerEnvironment.SIMULATED,
+):
+    order = request() if order is None else order
+    intent_value = intent() if intent_value is None else intent_value
+    notional = int(order.limit_price * order.quantity * 100)
+    return ReservationTerms(
+        account_id or order.account_id, intent_value.account_snapshot_id,
+        environment, "policy-v1", order.instrument, order.side,
+        int(order.quantity), "USD", "USD", 10_000_000, 0,
+        int(intent_value.current_quantity), 10_000_000, 10_000_000, 0,
+        notional if order.side is Side.BUY else 0,
+        notional if order.side is Side.BUY else 0,
+        int(order.quantity) if order.side is Side.SELL else 0,
+    )
+
+
+def reservation_payload(
+    permit_id,
+    account_id="acct",
+    environment=BrokerEnvironment.SIMULATED,
+    **extra,
+):
+    return {
+        "environment": environment.value,
+        "request": {
+            "account_id": account_id,
+            "instrument": {"market": "NASDAQ", "symbol": "AAPL", "currency": "USD"},
+            "side": "BUY", "quantity": "2",
+        },
+        "risk": {
+            "input_snapshot_environment": environment.value,
+            "input_snapshot_id": "snap",
+            "policy_version": "policy-v1",
+        },
+        "plan": {
+            "pricing_policy_version": "policy-v1",
+            "minimum_limit_price": "99",
+            "maximum_limit_price": "101",
+            "market_evidence": {
+                "snapshot_id": "market",
+                "environment": environment.value,
+                "observed_at": NOW.isoformat(),
+                "quality": SnapshotQuality.CONSISTENT.value,
+                "pricing_policy_version": "policy-v1",
+                "minimum_limit_price": "99",
+                "maximum_limit_price": "101",
+            },
+        },
+        "permit": {
+            "permit_id": permit_id,
+            "environment": environment.value,
+            "market_snapshot_id": "market",
+            "policy_version": "policy-v1",
+        },
+        **extra,
+    }
+
+
 def command(
     safety, action, command_id, account_id="acct", at=NOW, *, client_order_id=None,
 ):
     return OperatorCommand(
         command_id, "operator", "phase 1A test", "deploy-v1", safety.epoch,
-        at, at + timedelta(minutes=1), action, account_id, client_order_id,
+        at, at + timedelta(minutes=1), action, account_id, safety.environment,
+        client_order_id,
     )
 
 
@@ -158,19 +293,66 @@ def operator(safety, ledger=None, at=NOW):
     return service
 
 
-def reconciled_safety(trading=True):
-    safety = SafetyController()
+def reconciled_safety(
+    trading=True, environment=BrokerEnvironment.SIMULATED, *,
+    account_state=None, reservation_policy_value=None,
+):
+    safety = SafetyController(environment)
     ops = operator(safety)
     ops.acknowledge_startup_recovery(
         command(safety, OperatorAction.ACKNOWLEDGE_STARTUP_RECOVERY, "op-recovery")
     )
-    safety.complete_reconciliation(snapshot(), market(), "policy-v1", "deploy-v1", NOW)
+    snapshot_value = snapshot(environment=environment)
+    safety.complete_reconciliation(
+        snapshot_value, market(environment=environment),
+        account_state or reservation_account_state(snapshot_value),
+        reservation_policy_value or reservation_policy(),
+        "policy-v1", "deploy-v1", NOW,
+    )
     if trading:
         ops.arm(command(safety, OperatorAction.ARM, "op-arm"))
     return safety
 
 
 class DomainAndRiskTests(unittest.TestCase):
+    def test_reservation_authority_inputs_are_exact_bounded_and_unique(self):
+        instrument = InstrumentId("NASDAQ", "AAPL", "USD")
+        with self.assertRaises(ValueError):
+            ReservationPosition(instrument, True)
+        with self.assertRaises(ValueError):
+            ReservationAccountState(
+                "acct", "snap", "USD", 1, 0,
+                (ReservationPosition(instrument, 1), ReservationPosition(instrument, 2)),
+            )
+        with self.assertRaises(ValueError):
+            reservation_policy(cash_cap_minor=1 << 63)
+
+    def test_risk_reason_codes_are_machine_readable_unique_and_required(self):
+        approved = risk()
+        self.assertEqual(replace(approved, reason_codes=("INFO_ONLY",)).reason_codes,
+                         ("INFO_ONLY",))
+        for codes in (("lowercase",), ("BAD-CODE",), ("DUP", "DUP"), (1,)):
+            with self.subTest(codes=codes), self.assertRaises(ValueError):
+                replace(approved, reason_codes=codes)
+        with self.assertRaises(ValueError):
+            replace(approved, outcome=RiskOutcome.REJECTED, approved_quantity=Decimal(0))
+
+    def test_evidence_requires_exact_environment_and_authoritative_finite_band(self):
+        with self.assertRaises(ValueError):
+            replace(snapshot(), environment="SIMULATED")
+        with self.assertRaises(ValueError):
+            replace(market(), environment="SIMULATED")
+        for minimum, maximum in (
+            (Decimal("NaN"), Decimal("101")),
+            (Decimal("0"), Decimal("101")),
+            (Decimal("102"), Decimal("101")),
+        ):
+            with self.subTest(minimum=minimum, maximum=maximum), self.assertRaises(ValueError):
+                market(
+                    minimum_limit_price=minimum,
+                    maximum_limit_price=maximum,
+                )
+
     def test_decimal_utc_long_only_and_enum_invariants(self):
         with self.assertRaises(ValueError):
             request(quantity=Decimal("1.5"))
@@ -203,7 +385,7 @@ class DomainAndRiskTests(unittest.TestCase):
             replace(risk(), outcome="APPROVED")
 
     def test_unknown_resolution_command_requires_only_order_target(self):
-        safety = SafetyController()
+        safety = SafetyController(BrokerEnvironment.SIMULATED)
         with self.assertRaises(ValueError):
             command(
                 safety,
@@ -259,8 +441,81 @@ class DomainAndRiskTests(unittest.TestCase):
 
 
 class SafetyTests(unittest.TestCase):
+    def test_reconciliation_rejects_reservation_account_snapshot_and_policy_mismatch(self):
+        for account_state, policy_value in (
+            (reservation_account_state(replace(snapshot(), account_id="other")),
+             reservation_policy()),
+            (replace(reservation_account_state(), account_snapshot_id="other-snapshot"),
+             reservation_policy()),
+            (reservation_account_state(), reservation_policy(policy_version="policy-v2")),
+        ):
+            with self.subTest(account_state=account_state, policy=policy_value):
+                safety = SafetyController(BrokerEnvironment.SIMULATED)
+                ops = operator(safety)
+                ops.acknowledge_startup_recovery(command(
+                    safety, OperatorAction.ACKNOWLEDGE_STARTUP_RECOVERY,
+                    f"reservation-mismatch-{policy_value.policy_version}-{account_state.account_id}",
+                ))
+                with self.assertRaises(SafetyGuardError):
+                    safety.complete_reconciliation(
+                        snapshot(), market(), account_state, policy_value,
+                        "policy-v1", "deploy-v1", NOW,
+                    )
+                self.assertEqual(safety.state, SafetyState.RECONCILING)
+
+    def test_reconciliation_rejects_cross_environment_account_and_market_evidence(self):
+        safety = SafetyController(BrokerEnvironment.LIVE)
+        ops = operator(safety)
+        ops.acknowledge_startup_recovery(
+            command(
+                safety,
+                OperatorAction.ACKNOWLEDGE_STARTUP_RECOVERY,
+                "cross-env-recovery",
+            )
+        )
+        mismatches = (
+            (
+                snapshot(environment=BrokerEnvironment.PAPER),
+                market(environment=BrokerEnvironment.LIVE),
+            ),
+            (
+                snapshot(environment=BrokerEnvironment.LIVE),
+                market(environment=BrokerEnvironment.SIMULATED),
+            ),
+        )
+        for account_evidence, market_evidence in mismatches:
+            with self.assertRaises(SafetyGuardError):
+                safety.complete_reconciliation(
+                    account_evidence, market_evidence,
+                    reservation_account_state(account_evidence), reservation_policy(),
+                    "policy-v1", "deploy-v1", NOW,
+                )
+        self.assertEqual(safety.state, SafetyState.RECONCILING)
+
+    def test_arm_and_permit_recheck_evidence_environment(self):
+        ready = reconciled_safety(
+            trading=False, environment=BrokerEnvironment.LIVE
+        )
+        ready.evidence = replace(
+            ready.evidence,
+            account_snapshot=snapshot(environment=BrokerEnvironment.PAPER),
+        )
+        with self.assertRaises(SafetyGuardError):
+            operator(ready).arm(
+                command(ready, OperatorAction.ARM, "cross-env-arm")
+            )
+        self.assertEqual(ready.state, SafetyState.READY)
+
+        trading = reconciled_safety(environment=BrokerEnvironment.LIVE)
+        trading.evidence = replace(
+            trading.evidence,
+            market=market(environment=BrokerEnvironment.SIMULATED),
+        )
+        with self.assertRaises(InvalidPermit):
+            new_order_permit(trading)
+
     def test_global_operator_command_fails_closed_at_domain_and_boundary(self):
-        safety_a = SafetyController()
+        safety_a = SafetyController(BrokerEnvironment.SIMULATED)
         with self.assertRaises(ValueError):
             OperatorCommand(
                 "global-command",
@@ -272,11 +527,12 @@ class SafetyTests(unittest.TestCase):
                 NOW + timedelta(minutes=1),
                 OperatorAction.HALT,
                 None,
+                BrokerEnvironment.SIMULATED,
             )
 
         ledger = SQLiteLedger(":memory:")
         try:
-            safety_b = SafetyController()
+            safety_b = SafetyController(BrokerEnvironment.SIMULATED)
             service_a = OperatorCommandService(
                 ledger, safety_a, "deploy-v1", lambda: NOW, account_id="acct"
             )
@@ -298,7 +554,7 @@ class SafetyTests(unittest.TestCase):
 
     def test_operator_recovery_and_effects_are_account_scoped(self):
         ledger = SQLiteLedger(":memory:")
-        safety = SafetyController()
+        safety = SafetyController(BrokerEnvironment.SIMULATED)
         try:
             for command_id, account_id in (("pending-a", "acct"), ("pending-b", "other")):
                 pending = command(
@@ -327,7 +583,7 @@ class SafetyTests(unittest.TestCase):
             self.assertIn("PENDING_OPERATOR_COMMAND:pending-a", safety.blockers)
             self.assertNotIn("PENDING_OPERATOR_COMMAND:pending-b", safety.blockers)
 
-            clean_safety = SafetyController()
+            clean_safety = SafetyController(BrokerEnvironment.SIMULATED)
             scoped = OperatorCommandService(
                 ledger,
                 clean_safety,
@@ -345,7 +601,7 @@ class SafetyTests(unittest.TestCase):
             ledger.close()
 
     def test_direct_arm_and_forged_permit_fail(self):
-        safety = SafetyController()
+        safety = SafetyController(BrokerEnvironment.SIMULATED)
         with self.assertRaises(TypeError):
             safety.arm("op", NOW)
         safety = reconciled_safety()
@@ -377,14 +633,15 @@ class SafetyTests(unittest.TestCase):
 
     def test_permit_cannot_outlive_account_or_market_evidence(self):
         observed_at = NOW - timedelta(seconds=29)
-        safety = SafetyController()
+        safety = SafetyController(BrokerEnvironment.SIMULATED)
         ops = operator(safety)
         ops.acknowledge_startup_recovery(
             command(safety, OperatorAction.ACKNOWLEDGE_STARTUP_RECOVERY, "op-recovery")
         )
         safety.complete_reconciliation(
-            snapshot(observed_at=observed_at),
+            snapshot_value := snapshot(observed_at=observed_at),
             market(observed_at=observed_at),
+            reservation_account_state(snapshot_value), reservation_policy(),
             "policy-v1",
             "deploy-v1",
             NOW,
@@ -404,14 +661,14 @@ class SafetyTests(unittest.TestCase):
             )
 
     def test_unknown_blocker_requires_audited_resolution(self):
-        safety = SafetyController()
+        safety = SafetyController(BrokerEnvironment.SIMULATED)
         safety.block_unknown_submission("order")
         with self.assertRaises(TypeError):
             safety.acknowledge_startup_recovery("op")
         self.assertEqual(safety.state, SafetyState.HALTED)
 
     def test_cancel_is_operator_approved_short_lived_and_evidence_independent(self):
-        safety = SafetyController()
+        safety = SafetyController(BrokerEnvironment.SIMULATED)
         safety.halt()
         with self.assertRaises(InvalidPermit):
             safety.issue_permit("acct", PermitScope.CANCEL, NOW)
@@ -535,7 +792,7 @@ class LedgerAndExecutionTests(unittest.TestCase):
         return ExecutionService(
             broker,
             self.ledger,
-            safety or SafetyController(),
+            safety or reconciled_safety(environment=broker.environment),
             lambda: NOW,
             process_lock,
             account_id="acct",
@@ -545,7 +802,7 @@ class LedgerAndExecutionTests(unittest.TestCase):
         class UntouchedLedger:
             touched = False
 
-            def incomplete_submissions(self, account_id=None):
+            def incomplete_submissions(self, account_id=None, environment=None):
                 self.touched = True
                 raise AssertionError("ledger must not be touched")
 
@@ -553,13 +810,135 @@ class LedgerAndExecutionTests(unittest.TestCase):
         broker = FakeBroker(BrokerSubmitOutcome.ACKNOWLEDGED, BrokerEnvironment.LIVE)
         with self.assertRaises(SubmissionValidationError):
             ExecutionService(
-                broker, ledger, SafetyController(), lambda: NOW, account_id="acct"
+                broker, ledger, SafetyController(broker.environment), lambda: NOW,
+                account_id="acct"
             )
         self.assertFalse(ledger.touched)
         self.assertEqual(broker.calls, [])
 
-    def test_live_constructor_requires_lock_for_matching_account(self):
+    def test_submit_has_no_caller_controlled_reservation_terms_path(self):
+        service = self.service()
+        permit = new_order_permit(service.safety)
+        with self.assertRaises(TypeError):
+            service.submit(
+                request(), risk(), plan(), intent(), permit,
+                reservation_terms=reservation_terms(),
+            )
+        self.assertEqual(service.broker.calls, [])
+        self.assertEqual(self.ledger.events_for("order-1"), ())
+
+    def test_buy_reservation_is_derived_from_authoritative_state_and_policy(self):
+        state = reservation_account_state(
+            available_cash_minor=50_000, current_exposure_minor=7_000,
+            position_quantity=3,
+        )
+        policy_value = reservation_policy(
+            cash_cap_minor=40_000, exposure_cap_minor=30_000,
+            fee_buffer_minor=125,
+        )
+        safety = reconciled_safety(
+            account_state=state, reservation_policy_value=policy_value
+        )
+        service = self.service(safety=safety)
+        self.assertEqual(
+            submit(service, request(), risk(), plan(), intent()),
+            SubmissionState.ACKNOWLEDGED,
+        )
+        row = self.ledger.connection.execute(
+            """SELECT available_cash_minor,current_exposure_minor,
+                      current_position_quantity,cash_cap_minor,exposure_cap_minor,
+                      fee_buffer_minor,reserved_cash_minor,reserved_exposure_minor
+               FROM risk_reservations WHERE client_order_id='order-1'"""
+        ).fetchone()
+        self.assertEqual(row, (50_000, 7_000, 3, 40_000, 30_000, 125, 20_175, 20_050))
+
+    def test_authoritative_buy_capacity_blocks_without_effects(self):
+        cases = (
+            (
+                "cash-available",
+                reservation_account_state(available_cash_minor=20_174),
+                reservation_policy(fee_buffer_minor=125),
+            ),
+            (
+                "cash-cap",
+                reservation_account_state(),
+                reservation_policy(cash_cap_minor=20_174, fee_buffer_minor=125),
+            ),
+            (
+                "exposure-cap",
+                reservation_account_state(),
+                reservation_policy(exposure_cap_minor=20_049),
+            ),
+        )
+        for order_id, state, policy_value in cases:
+            with self.subTest(order_id=order_id):
+                safety = reconciled_safety(
+                    account_state=state, reservation_policy_value=policy_value
+                )
+                service = self.service(safety=safety)
+                with self.assertRaises(OrderReservationConflict):
+                    submit(service, request(order_id), risk(), plan(), intent())
+                self.assertEqual(service.broker.calls, [])
+                self.assertEqual(self.ledger.events_for(order_id), ())
+
+    def test_authoritative_sell_position_and_evidence_mismatches_fail_before_effects(self):
+        for order_id, positions in (
+            ("forged-position", (
+                ReservationPosition(InstrumentId("NASDAQ", "AAPL", "USD"), 3),
+            )),
+            ("missing-position", ()),
+        ):
+            with self.subTest(order_id=order_id):
+                state = reservation_account_state(positions=positions)
+                safety = reconciled_safety(account_state=state)
+                service = self.service(safety=safety)
+                forged_intent = intent(Decimal("-4"), current=Decimal("100"))
+                with self.assertRaises(OrderReservationConflict):
+                    submit(
+                        service, request(order_id, Decimal("-4")),
+                        risk(Decimal("-4")), plan(Decimal("-4")), forged_intent,
+                    )
+                self.assertEqual(service.broker.calls, [])
+                self.assertEqual(self.ledger.events_for(order_id), ())
+
+        for order_id, evidence_change in (
+            ("snapshot-mismatch", {"account_snapshot_id": "forged-snapshot"}),
+            ("account-mismatch", {"account_id": "other-account"}),
+        ):
+            with self.subTest(order_id=order_id):
+                safety = reconciled_safety()
+                service = self.service(safety=safety)
+                permit = new_order_permit(safety, order_id=order_id)
+                safety.evidence = replace(
+                    safety.evidence,
+                    reservation_account_state=replace(
+                        safety.evidence.reservation_account_state, **evidence_change
+                    ),
+                )
+                with self.assertRaises(SubmissionValidationError):
+                    submit(service, request(order_id), risk(), plan(), intent(), permit)
+                self.assertEqual(service.broker.calls, [])
+                self.assertEqual(self.ledger.events_for(order_id), ())
+
         safety = reconciled_safety()
+        service = self.service(safety=safety)
+        permit = new_order_permit(safety, order_id="policy-mismatch")
+        safety.evidence = replace(
+            safety.evidence,
+            risk_reservation_policy=replace(
+                safety.evidence.risk_reservation_policy,
+                policy_version="policy-v2",
+            ),
+        )
+        with self.assertRaises(SubmissionValidationError):
+            submit(
+                service, request("policy-mismatch"), risk(), plan(), intent(), permit,
+            )
+        self.assertEqual(service.broker.calls, [])
+        self.assertEqual(self.ledger.events_for("policy-mismatch"), ())
+
+    def test_live_constructor_requires_lock_for_matching_account(self):
+        safety = reconciled_safety(environment=BrokerEnvironment.LIVE)
         wrong_lock = AccountProcessLock(
             self.path, "other-account", "deploy-v1"
         )
@@ -581,7 +960,7 @@ class LedgerAndExecutionTests(unittest.TestCase):
             wrong_lock.release()
 
     def test_live_constructor_rejects_same_account_lock_for_another_runtime(self):
-        safety = reconciled_safety()
+        safety = reconciled_safety(environment=BrokerEnvironment.LIVE)
         wrong_runtime_lock = AccountProcessLock(
             Path(self.temp.name) / "other.db", "acct", "deploy-v1"
         )
@@ -602,7 +981,7 @@ class LedgerAndExecutionTests(unittest.TestCase):
             wrong_runtime_lock.release()
 
     def test_live_submit_fails_closed_after_outer_lock_release(self):
-        safety = reconciled_safety()
+        safety = reconciled_safety(environment=BrokerEnvironment.LIVE)
         broker = FakeBroker(BrokerSubmitOutcome.ACKNOWLEDGED, BrokerEnvironment.LIVE)
         service = ExecutionService(
             broker,
@@ -614,15 +993,15 @@ class LedgerAndExecutionTests(unittest.TestCase):
         )
         self.account_lock.release()
         with self.assertRaises(SubmissionValidationError):
-            service.submit(request(), risk(), plan(), intent(), new_order_permit(safety))
+            submit(service, request(), risk(), plan(), intent(), new_order_permit(safety))
         self.assertEqual(self.ledger.events_for("order-1"), ())
         self.assertEqual(broker.calls, [])
 
     def test_live_submit_rejects_request_for_another_account(self):
-        safety = reconciled_safety()
+        safety = reconciled_safety(environment=BrokerEnvironment.LIVE)
         service = self.service(safety=safety, environment=BrokerEnvironment.LIVE)
         with self.assertRaises(SubmissionValidationError):
-            service.submit(
+            submit(service,
                 replace(request(), account_id="other-account"),
                 risk(),
                 plan(),
@@ -633,32 +1012,33 @@ class LedgerAndExecutionTests(unittest.TestCase):
         self.assertEqual(service.broker.calls, [])
 
     def test_live_submit_succeeds_with_matching_outer_lock(self):
-        safety = reconciled_safety()
+        safety = reconciled_safety(environment=BrokerEnvironment.LIVE)
         service = self.service(safety=safety, environment=BrokerEnvironment.LIVE)
         self.assertEqual(
-            service.submit(request(), risk(), plan(), intent(), new_order_permit(safety)),
+            submit(service, request(), risk(), plan(), intent(), new_order_permit(safety)),
             SubmissionState.ACKNOWLEDGED,
         )
 
     def test_simulated_constructor_does_not_require_process_lock(self):
         service = self.service()
         self.assertEqual(
-            service.submit(request(), risk(), plan(), intent()),
+            submit(service, request(), risk(), plan(), intent()),
             SubmissionState.ACKNOWLEDGED,
         )
 
     def test_non_live_startup_does_not_recover_other_accounts_live_inflight(self):
         self.ledger.reserve_submission(
             "live-inflight",
-            {"request": {"account_id": "acct"}, "permit": None},
+            reservation_payload("live-inflight-permit"),
             LedgerEvent("live-prepared", "PREPARED", "live-inflight", NOW, {}),
             LedgerEvent("live-started", "SUBMISSION_STARTED", "live-inflight", NOW, {}),
-            None,
+            "live-inflight-permit",
+            reservation_terms(),
         )
         ExecutionService(
             FakeBroker(BrokerSubmitOutcome.ACKNOWLEDGED, BrokerEnvironment.SIMULATED),
             self.ledger,
-            SafetyController(),
+            SafetyController(BrokerEnvironment.SIMULATED),
             lambda: NOW,
             account_id="other-account",
         )
@@ -671,15 +1051,20 @@ class LedgerAndExecutionTests(unittest.TestCase):
         for order_id, account_id in (("owned", "acct"), ("foreign", "other-account")):
             self.ledger.reserve_submission(
                 order_id,
-                {"request": {"account_id": account_id}, "permit": None},
+                reservation_payload(
+                    f"{order_id}-permit", account_id, BrokerEnvironment.LIVE
+                ),
                 LedgerEvent(f"{order_id}-prepared", "PREPARED", order_id, NOW, {}),
                 LedgerEvent(f"{order_id}-started", "SUBMISSION_STARTED", order_id, NOW, {}),
-                None,
+                f"{order_id}-permit",
+                reservation_terms(
+                    account_id=account_id, environment=BrokerEnvironment.LIVE
+                ),
             )
         ExecutionService(
             FakeBroker(BrokerSubmitOutcome.ACKNOWLEDGED, BrokerEnvironment.LIVE),
             self.ledger,
-            SafetyController(),
+            SafetyController(BrokerEnvironment.LIVE),
             lambda: NOW,
             self.account_lock,
             account_id="acct",
@@ -691,15 +1076,20 @@ class LedgerAndExecutionTests(unittest.TestCase):
         for order_id, account_id in (("owned", "acct"), ("foreign", "other-account")):
             self.ledger.reserve_submission(
                 order_id,
-                {"request": {"account_id": account_id}, "permit": None},
+                reservation_payload(
+                    f"{order_id}-permit", account_id, BrokerEnvironment.LIVE
+                ),
                 LedgerEvent(f"{order_id}-prepared", "PREPARED", order_id, NOW, {}),
                 LedgerEvent(f"{order_id}-started", "SUBMISSION_STARTED", order_id, NOW, {}),
-                None,
+                f"{order_id}-permit",
+                reservation_terms(
+                    account_id=account_id, environment=BrokerEnvironment.LIVE
+                ),
             )
             self.ledger.append(
                 LedgerEvent(f"{order_id}-unknown", "SUBMITTED_UNKNOWN", order_id, NOW, {})
             )
-        safety = SafetyController()
+        safety = SafetyController(BrokerEnvironment.LIVE)
         ExecutionService(
             FakeBroker(BrokerSubmitOutcome.ACKNOWLEDGED, BrokerEnvironment.LIVE),
             self.ledger,
@@ -710,6 +1100,60 @@ class LedgerAndExecutionTests(unittest.TestCase):
         )
         self.assertIn("SUBMITTED_UNKNOWN:owned", safety.blockers)
         self.assertNotIn("SUBMITTED_UNKNOWN:foreign", safety.blockers)
+
+    def test_live_startup_does_not_recover_or_block_same_alias_paper_orders(self):
+        for environment in (BrokerEnvironment.PAPER, BrokerEnvironment.LIVE):
+            prefix = environment.value.lower()
+            for state in ("pending", "unknown"):
+                order_id = f"{prefix}-{state}"
+                self.ledger.reserve_submission(
+                    order_id,
+                    reservation_payload(
+                        f"{order_id}-permit", environment=environment
+                    ),
+                    LedgerEvent(
+                        f"{order_id}-prepared", "PREPARED", order_id, NOW, {}
+                    ),
+                    LedgerEvent(
+                        f"{order_id}-started",
+                        "SUBMISSION_STARTED",
+                        order_id,
+                        NOW,
+                        {},
+                    ),
+                    f"{order_id}-permit",
+                    reservation_terms(environment=environment),
+                )
+                if state == "unknown":
+                    self.ledger.append(LedgerEvent(
+                        f"{order_id}-unknown",
+                        "SUBMITTED_UNKNOWN",
+                        order_id,
+                        NOW,
+                        {},
+                    ))
+
+        safety = SafetyController(BrokerEnvironment.LIVE)
+        ExecutionService(
+            FakeBroker(BrokerSubmitOutcome.ACKNOWLEDGED, BrokerEnvironment.LIVE),
+            self.ledger,
+            safety,
+            lambda: NOW,
+            self.account_lock,
+            account_id="acct",
+        )
+
+        self.assertEqual(
+            self.ledger.events_for("paper-pending")[-1].event_type,
+            "SUBMISSION_STARTED",
+        )
+        self.assertEqual(
+            self.ledger.events_for("live-pending")[-1].event_type,
+            "SUBMITTED_UNKNOWN",
+        )
+        self.assertNotIn("SUBMITTED_UNKNOWN:paper-unknown", safety.blockers)
+        self.assertIn("SUBMITTED_UNKNOWN:live-unknown", safety.blockers)
+        self.assertIn("SUBMITTED_UNKNOWN:live-pending", safety.blockers)
 
     def test_live_hold_covers_reservation_broker_and_terminal_record(self):
         reserved = threading.Event()
@@ -758,7 +1202,7 @@ class LedgerAndExecutionTests(unittest.TestCase):
             self.account_lock.release()
             released.set()
 
-        safety = reconciled_safety()
+        safety = reconciled_safety(environment=BrokerEnvironment.LIVE)
         broker = RacingBroker()
         service = ExecutionService(
             broker,
@@ -771,7 +1215,7 @@ class LedgerAndExecutionTests(unittest.TestCase):
         releaser = threading.Thread(target=release_after_reservation)
         releaser.start()
         self.assertEqual(
-            service.submit(request(), risk(), plan(), intent(), new_order_permit(safety)),
+            submit(service, request(), risk(), plan(), intent(), new_order_permit(safety)),
             SubmissionState.ACKNOWLEDGED,
         )
         releaser.join(2)
@@ -797,14 +1241,17 @@ class LedgerAndExecutionTests(unittest.TestCase):
         prepared = LedgerEvent("prepare", "PREPARED", "same", NOW, {})
         started = LedgerEvent("started", "SUBMISSION_STARTED", "same", NOW, {})
         self.assertTrue(self.ledger.reserve_submission(
-            "same", {"quantity": "1", "permit": None}, prepared, started, None,
+            "same", reservation_payload("same-permit", quantity="1"), prepared,
+            started, "same-permit", reservation_terms(),
         ))
         self.assertFalse(self.ledger.reserve_submission(
-            "same", {"quantity": "1", "permit": None}, prepared, started, None,
+            "same", reservation_payload("same-permit", quantity="1"), prepared,
+            started, "same-permit", reservation_terms(),
         ))
         with self.assertRaises(OrderReservationConflict):
             self.ledger.reserve_submission(
-                "same", {"quantity": "2", "permit": None}, prepared, started, None,
+                "same", reservation_payload("same-permit", quantity="2"), prepared,
+                started, "same-permit", reservation_terms(),
             )
         with self.assertRaises(sqlite3.IntegrityError):
             self.ledger.connection.execute(
@@ -823,10 +1270,13 @@ class LedgerAndExecutionTests(unittest.TestCase):
         )):
             order = request(f"order-{index}")
             service = self.service(outcome)
-            self.assertEqual(service.submit(order, risk(), plan(), intent()), expected)
+            self.assertEqual(submit(service, order, risk(), plan(), intent()), expected)
             self.assertEqual(
                 [event.event_type for event in self.ledger.events_for(order.client_order_id)],
-                ["PREPARED", "SUBMISSION_STARTED", expected.value],
+                [
+                    "RISK_RESERVED", "PREPARED", "SUBMISSION_STARTED", expected.value,
+                    *(["RISK_RELEASED"] if outcome is BrokerSubmitOutcome.REJECTED else []),
+                ],
             )
             if outcome is BrokerSubmitOutcome.UNKNOWN:
                 self.assertEqual(service.safety.state, SafetyState.HALTED)
@@ -834,7 +1284,7 @@ class LedgerAndExecutionTests(unittest.TestCase):
                     service.submit(order, risk(), plan(), intent())
 
     def test_broker_environment_controls_live_permit(self):
-        live_safety = reconciled_safety()
+        live_safety = reconciled_safety(environment=BrokerEnvironment.LIVE)
         service = self.service(
             safety=live_safety,
             environment=BrokerEnvironment.LIVE,
@@ -843,19 +1293,19 @@ class LedgerAndExecutionTests(unittest.TestCase):
             service.submit(request(), risk(), plan(), intent())
         permit = new_order_permit(live_safety)
         self.assertEqual(
-            service.submit(request(), risk(), plan(), intent(), permit),
+            submit(service, request(), risk(), plan(), intent(), permit),
             SubmissionState.ACKNOWLEDGED,
         )
         with self.assertRaises(AlreadySubmitted):
-            service.submit(request(), risk(), plan(), intent(), permit)
+            submit(service, request(), risk(), plan(), intent(), permit)
         self.assertEqual(len(service.broker.calls), 1)
 
     def test_live_risk_must_match_permit_evidence(self):
-        live_safety = reconciled_safety()
+        live_safety = reconciled_safety(environment=BrokerEnvironment.LIVE)
         service = self.service(safety=live_safety, environment=BrokerEnvironment.LIVE)
         permit = new_order_permit(live_safety)
         with self.assertRaises(SubmissionValidationError):
-            service.submit(
+            submit(service,
                 request(), risk(snapshot_id="different"), plan(), intent(), permit
             )
         self.assertEqual(len(service.broker.calls), 0)
@@ -867,23 +1317,26 @@ class LedgerAndExecutionTests(unittest.TestCase):
             ("plan_id", "other-plan"),
         ):
             with self.subTest(field=field):
-                live_safety = reconciled_safety()
+                live_safety = reconciled_safety(environment=BrokerEnvironment.LIVE)
                 service = self.service(
                     safety=live_safety, environment=BrokerEnvironment.LIVE
                 )
                 permit = new_order_permit(live_safety, **{field: value})
                 with self.assertRaises(InvalidPermit):
-                    service.submit(request(), risk(), plan(), intent(), permit)
+                    submit(service, request(), risk(), plan(), intent(), permit)
                 self.assertEqual(service.broker.calls, [])
                 self.assertEqual(self.ledger.events_for("order-1"), ())
 
     def test_simulated_submission_rejects_live_permit_without_effect(self):
-        live_safety = reconciled_safety()
-        service = self.service(safety=live_safety)
+        live_safety = reconciled_safety(environment=BrokerEnvironment.LIVE)
         with self.assertRaises(SubmissionValidationError):
-            service.submit(
-                request(), risk(), plan(), intent(), new_order_permit(live_safety)
-            )
+            self.service(safety=live_safety)
+        self.assertEqual(self.ledger.events_for("order-1"), ())
+
+    def test_simulated_submission_rejects_permitless_without_effect(self):
+        service = self.service()
+        with self.assertRaises(SubmissionValidationError):
+            service.submit(request(), risk(), plan(), intent())
         self.assertEqual(service.broker.calls, [])
         self.assertEqual(self.ledger.events_for("order-1"), ())
 
@@ -895,14 +1348,16 @@ class LedgerAndExecutionTests(unittest.TestCase):
             )
 
         first_prepared, first_started = events("first")
-        payload = {"permit": {"permit_id": "single-use"}}
+        payload = reservation_payload("single-use")
         self.assertTrue(self.ledger.reserve_submission(
             "first", payload, first_prepared, first_started, "single-use",
+            reservation_terms(),
         ))
         second_prepared, second_started = events("second")
         with self.assertRaises(PermitAlreadyConsumed):
             self.ledger.reserve_submission(
                 "second", payload, second_prepared, second_started, "single-use",
+                reservation_terms(),
             )
         self.assertEqual(self.ledger.events_for("second"), ())
 
@@ -912,11 +1367,12 @@ class LedgerAndExecutionTests(unittest.TestCase):
                  SELECT RAISE(ABORT, 'injected started failure'); END"""
         )
         rollback_prepared, rollback_started = events("rollback")
-        rollback_payload = {"permit": {"permit_id": "rollback-permit"}}
+        rollback_payload = reservation_payload("rollback-permit")
         with self.assertRaises(sqlite3.IntegrityError):
             self.ledger.reserve_submission(
                 "rollback", rollback_payload, rollback_prepared, rollback_started,
                 "rollback-permit",
+                reservation_terms(),
             )
         self.assertIsNone(self.ledger.connection.execute(
             "SELECT 1 FROM order_requests WHERE client_order_id = 'rollback'"
@@ -926,6 +1382,7 @@ class LedgerAndExecutionTests(unittest.TestCase):
         self.assertTrue(self.ledger.reserve_submission(
             "rollback", rollback_payload, rollback_prepared, rollback_started,
             "rollback-permit",
+            reservation_terms(),
         ))
 
     def test_consumed_permit_is_not_a_persistence_failure(self):
@@ -939,7 +1396,7 @@ class LedgerAndExecutionTests(unittest.TestCase):
             def reserve_submission(self, *unused_args):
                 raise PermitAlreadyConsumed("already consumed")
 
-        live_safety = reconciled_safety()
+        live_safety = reconciled_safety(environment=BrokerEnvironment.LIVE)
         broker = FakeBroker(BrokerSubmitOutcome.ACKNOWLEDGED, BrokerEnvironment.LIVE)
         service = ExecutionService(
             broker,
@@ -950,7 +1407,7 @@ class LedgerAndExecutionTests(unittest.TestCase):
             account_id="acct",
         )
         with self.assertRaises(AlreadySubmitted):
-            service.submit(
+            submit(service,
                 request(), risk(), plan(), intent(), new_order_permit(live_safety)
             )
         self.assertEqual(live_safety.state, SafetyState.TRADING)
@@ -959,16 +1416,181 @@ class LedgerAndExecutionTests(unittest.TestCase):
     def test_absent_rejected_stale_and_mismatched_evidence_fail(self):
         service = self.service()
         with self.assertRaises(TypeError):
-            service.submit(request())
+            submit(service, request())
         with self.assertRaises(SubmissionValidationError):
-            service.submit(
+            submit(service,
                 request(), risk(outcome=RiskOutcome.REJECTED), plan(), intent()
             )
         with self.assertRaises(SubmissionValidationError):
-            service.submit(request(), risk(), plan(expires_at=NOW), intent())
+            submit(service, request(), risk(), plan(expires_at=NOW), intent())
         with self.assertRaises(SubmissionValidationError):
-            service.submit(request(), risk(), plan(price=Decimal("99")), intent())
+            submit(service, request(), risk(), plan(price=Decimal("99")), intent())
         self.assertEqual(len(service.broker.calls), 0)
+
+    def test_execution_plan_evidence_policy_band_and_canonical_payload(self):
+        service = self.service()
+        for changes in (
+            {"pricing_policy_version": "policy-v2"},
+            {"minimum_limit_price": Decimal("100.50"), "limit_price": Decimal("100.50")},
+        ):
+            with self.assertRaises(ValueError):
+                replace(plan(), **changes)
+        widened_market = market(
+            minimum_limit_price=Decimal("98"),
+            maximum_limit_price=Decimal("102"),
+        )
+        mismatches = (
+            replace(plan(), market_evidence=market(SnapshotQuality.STALE)),
+            replace(
+                plan(), market_evidence=widened_market,
+                minimum_limit_price=Decimal("98"), maximum_limit_price=Decimal("102"),
+            ),
+        )
+        for index, mismatched in enumerate(mismatches):
+            with self.assertRaises(SubmissionValidationError):
+                submit(service,
+                    request(f"plan-mismatch-{index}"), risk(), mismatched, intent()
+                )
+        self.assertEqual(service.broker.calls, [])
+
+        self.assertEqual(
+            submit(service, request("plan-evidence"), risk(), plan(), intent()),
+            SubmissionState.ACKNOWLEDGED,
+        )
+        raw = self.ledger.connection.execute(
+            "SELECT canonical_json FROM order_requests WHERE client_order_id = ?",
+            ("plan-evidence",),
+        ).fetchone()[0]
+        canonical = json.loads(raw)["plan"]
+        self.assertEqual(canonical["market_evidence"], {
+            "snapshot_id": "market",
+            "environment": BrokerEnvironment.SIMULATED.value,
+            "observed_at": NOW.isoformat(),
+            "quality": SnapshotQuality.CONSISTENT.value,
+            "pricing_policy_version": "policy-v1",
+            "minimum_limit_price": "99",
+            "maximum_limit_price": "101",
+        })
+        self.assertEqual(canonical["pricing_policy_version"], "policy-v1")
+        self.assertEqual(canonical["minimum_limit_price"], "99")
+        self.assertEqual(canonical["maximum_limit_price"], "101")
+        full_canonical = json.loads(raw)
+        self.assertEqual(
+            full_canonical["risk"]["input_snapshot_environment"],
+            BrokerEnvironment.SIMULATED.value,
+        )
+
+    def test_live_submit_rejects_simulated_market_evidence_before_effect(self):
+        safety = reconciled_safety(environment=BrokerEnvironment.LIVE)
+        service = self.service(safety=safety, environment=BrokerEnvironment.LIVE)
+        permit = new_order_permit(safety)
+        with self.assertRaises(SubmissionValidationError):
+            service.submit(request(), risk(), plan(), intent(), permit)
+        self.assertEqual(service.broker.calls, [])
+        self.assertEqual(self.ledger.events_for("order-1"), ())
+
+    def test_execution_plan_rejects_bool_and_nonfinite_monotonic_values(self):
+        for value in (True, float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                replace(plan(), created_monotonic=value)
+
+    def test_paper_uses_the_same_permit_and_environment_contract(self):
+        safety = reconciled_safety(environment=BrokerEnvironment.PAPER)
+        service = self.service(safety=safety, environment=BrokerEnvironment.PAPER)
+        order = request("paper-order")
+        permit = new_order_permit(safety, order_id=order.client_order_id)
+        self.assertEqual(
+            submit(service, order, risk(), plan(), intent(), permit),
+            SubmissionState.ACKNOWLEDGED,
+        )
+        raw = self.ledger.connection.execute(
+            "SELECT canonical_json FROM order_requests WHERE client_order_id = ?",
+            (order.client_order_id,),
+        ).fetchone()[0]
+        canonical = json.loads(raw)
+        self.assertEqual(canonical["environment"], BrokerEnvironment.PAPER.value)
+        self.assertEqual(canonical["permit"]["environment"], BrokerEnvironment.PAPER.value)
+
+    def test_plan_wall_rollback_and_clock_session_mismatch_never_revalidate(self):
+        broker = FakeBroker(BrokerSubmitOutcome.ACKNOWLEDGED)
+        safety = reconciled_safety()
+        service = ExecutionService(
+            broker,
+            self.ledger,
+            safety,
+            lambda: NOW - timedelta(seconds=1),
+            account_id="acct",
+            monotonic_clock=lambda: 11.0,
+            clock_session_id="current-session",
+        )
+        bound = replace(
+            plan(), clock_session_id="current-session",
+            created_monotonic=10.0, expires_monotonic=20.0,
+        )
+        permit = new_order_permit(safety, order_id="rollback-plan")
+        with self.assertRaises(SubmissionValidationError):
+            submit(service, request("rollback-plan"), risk(), bound, intent(), permit)
+        service.clock = lambda: NOW
+        with self.assertRaises(SubmissionValidationError):
+            submit(service, request("rollback-plan"), risk(), bound, intent(), permit)
+        restarted = replace(bound, plan_id="restart-plan", clock_session_id="old-session")
+        with self.assertRaises(SubmissionValidationError):
+            submit(service,
+                replace(request("restart-plan"), execution_plan_id="restart-plan"),
+                risk(), restarted, intent(), permit,
+            )
+        self.assertEqual(broker.calls, [])
+
+    def test_permit_monotonic_expiry_never_revalidates(self):
+        reading = [10.0]
+        safety = SafetyController(BrokerEnvironment.SIMULATED, lambda: reading[0])
+        ops = operator(safety)
+        ops.acknowledge_startup_recovery(
+            command(safety, OperatorAction.ACKNOWLEDGE_STARTUP_RECOVERY, "mono-recovery")
+        )
+        snapshot_value = snapshot()
+        safety.complete_reconciliation(
+            snapshot_value, market(), reservation_account_state(snapshot_value),
+            reservation_policy(), "policy-v1", "deploy-v1", NOW,
+        )
+        ops.arm(command(safety, OperatorAction.ARM, "mono-arm"))
+        permit = new_order_permit(safety, ttl_seconds=20)
+
+        reading[0] = 31.0
+        with self.assertRaises(InvalidPermit):
+            safety.validate(
+                permit, "acct", PermitScope.NEW_ORDER, NOW,
+                client_order_id="order-1", risk_decision_id="risk",
+                execution_plan_id="plan",
+            )
+        reading[0] = 11.0
+        with self.assertRaises(InvalidPermit):
+            safety.validate(
+                permit, "acct", PermitScope.NEW_ORDER, NOW,
+                client_order_id="order-1", risk_decision_id="risk",
+                execution_plan_id="plan",
+            )
+        self.assertEqual(safety.state, SafetyState.HALTED)
+
+    def test_monotonic_failure_halts_before_ledger_or_broker_effect(self):
+        safety = reconciled_safety()
+        broker = FakeBroker(BrokerSubmitOutcome.ACKNOWLEDGED)
+
+        def fail_monotonic():
+            raise RuntimeError("monotonic unavailable")
+
+        service = ExecutionService(
+            broker, self.ledger, safety, lambda: NOW, account_id="acct",
+            monotonic_clock=fail_monotonic,
+        )
+        with self.assertRaises(SubmissionValidationError):
+            submit(service,
+                request("mono-failure"), risk(), plan(), intent(),
+                new_order_permit(safety, order_id="mono-failure"),
+            )
+        self.assertEqual(broker.calls, [])
+        self.assertEqual(self.ledger.events_for("mono-failure"), ())
+        self.assertIn("CLOCK_FAILURE", safety.blockers)
 
     def test_malformed_broker_result_is_unknown_and_halts(self):
         class MalformedBroker:
@@ -977,12 +1599,12 @@ class LedgerAndExecutionTests(unittest.TestCase):
             def submit(self, unused_request):
                 return {"outcome": "ACKNOWLEDGED", "broker_order_id": "fake"}
 
-        safety = SafetyController()
+        safety = reconciled_safety()
         service = ExecutionService(
             MalformedBroker(), self.ledger, safety, lambda: NOW, account_id="acct"
         )
         self.assertEqual(
-            service.submit(request(), risk(), plan(), intent()),
+            submit(service, request(), risk(), plan(), intent()),
             SubmissionState.SUBMITTED_UNKNOWN,
         )
         self.assertEqual(safety.state, SafetyState.HALTED)
@@ -998,12 +1620,12 @@ class LedgerAndExecutionTests(unittest.TestCase):
             def submit(self, unused_request):
                 return ForgedResult("ACKNOWLEDGED", "fake-id", "free text")
 
-        safety = SafetyController()
+        safety = reconciled_safety()
         service = ExecutionService(
             ForgedBroker(), self.ledger, safety, lambda: NOW, account_id="acct"
         )
         self.assertEqual(
-            service.submit(request(), risk(), plan(), intent()),
+            submit(service, request(), risk(), plan(), intent()),
             SubmissionState.SUBMITTED_UNKNOWN,
         )
         self.assertEqual(safety.state, SafetyState.HALTED)
@@ -1018,13 +1640,13 @@ class LedgerAndExecutionTests(unittest.TestCase):
                 raise RuntimeError("clock failed after broker side effect")
             return NOW
 
-        safety = SafetyController()
+        safety = reconciled_safety()
         broker = FakeBroker(BrokerSubmitOutcome.ACKNOWLEDGED)
         service = ExecutionService(
             broker, self.ledger, safety, failing_clock, account_id="acct"
         )
         self.assertEqual(
-            service.submit(request("clock-failure"), risk(), plan(), intent()),
+            submit(service, request("clock-failure"), risk(), plan(), intent()),
             SubmissionState.SUBMITTED_UNKNOWN,
         )
         self.assertEqual(len(broker.calls), 1)
@@ -1045,7 +1667,7 @@ class LedgerAndExecutionTests(unittest.TestCase):
             broker, self.ledger, safety, failing_clock, account_id="acct"
         )
         with self.assertRaises(SubmissionValidationError):
-            service.submit(request("pre-clock-failure"), risk(), plan(), intent())
+            submit(service, request("pre-clock-failure"), risk(), plan(), intent())
         self.assertEqual(safety.state, SafetyState.HALTED)
         self.assertIn("CLOCK_FAILURE", safety.blockers)
         self.assertEqual(broker.calls, [])
@@ -1054,12 +1676,12 @@ class LedgerAndExecutionTests(unittest.TestCase):
     def test_long_only_intent_allows_buy_and_reduction_but_blocks_naked_sell(self):
         buy_service = self.service()
         self.assertEqual(
-            buy_service.submit(request("buy"), risk(), plan(), intent()),
+            submit(buy_service, request("buy"), risk(), plan(), intent()),
             SubmissionState.ACKNOWLEDGED,
         )
         sell_service = self.service()
         self.assertEqual(
-            sell_service.submit(
+            submit(sell_service,
                 request("sell", Decimal("-2")),
                 risk(Decimal("-2")),
                 plan(Decimal("-2")),
@@ -1068,7 +1690,7 @@ class LedgerAndExecutionTests(unittest.TestCase):
             SubmissionState.ACKNOWLEDGED,
         )
 
-        live_safety = reconciled_safety()
+        live_safety = reconciled_safety(environment=BrokerEnvironment.LIVE)
         live_service = self.service(
             safety=live_safety, environment=BrokerEnvironment.LIVE
         )
@@ -1079,7 +1701,7 @@ class LedgerAndExecutionTests(unittest.TestCase):
             Decimal(0), Decimal(0), Decimal(2), Decimal("-2"), NOW,
         )
         with self.assertRaises(SubmissionValidationError):
-            live_service.submit(
+            submit(live_service,
                 request("naked", Decimal("-2")),
                 risk(Decimal("-2")),
                 plan(Decimal("-2")),
@@ -1106,11 +1728,11 @@ class LedgerAndExecutionTests(unittest.TestCase):
             def events_for(self, aggregate_id):
                 return self.real.events_for(aggregate_id)
 
-            def incomplete_submissions(self, account_id=None):
-                return self.real.incomplete_submissions(account_id)
+            def incomplete_submissions(self, account_id=None, environment=None):
+                return self.real.incomplete_submissions(account_id, environment)
 
-            def unresolved_unknown_submissions(self, account_id=None):
-                return self.real.unresolved_unknown_submissions(account_id)
+            def unresolved_unknown_submissions(self, account_id=None, environment=None):
+                return self.real.unresolved_unknown_submissions(account_id, environment)
 
             def record_unknown_resolution(self, *args):
                 return self.real.record_unknown_resolution(*args)
@@ -1118,7 +1740,7 @@ class LedgerAndExecutionTests(unittest.TestCase):
             def integrity_check(self):
                 return self.real.integrity_check()
 
-        safety = SafetyController()
+        safety = reconciled_safety()
         broker = FakeBroker(BrokerSubmitOutcome.ACKNOWLEDGED)
         service = ExecutionService(
             broker,
@@ -1129,7 +1751,7 @@ class LedgerAndExecutionTests(unittest.TestCase):
         )
         order = request("persistence-failure")
         with self.assertRaises(PersistenceFailure):
-            service.submit(order, risk(), plan(), intent())
+            submit(service, order, risk(), plan(), intent())
         self.assertEqual(safety.state, SafetyState.HALTED)
         self.assertEqual(len(broker.calls), 1)
         with self.assertRaises(AlreadySubmitted):
@@ -1141,14 +1763,15 @@ class LedgerAndExecutionTests(unittest.TestCase):
         prepared = LedgerEvent("restart-prepared", "PREPARED", order.client_order_id, NOW, {})
         self.ledger.reserve_submission(
             order.client_order_id,
-            {"request": {"account_id": "acct"}, "permit": None},
+            reservation_payload("restart-permit"),
             prepared,
             LedgerEvent("restart-started", "SUBMISSION_STARTED", order.client_order_id, NOW, {}),
-            None,
+            "restart-permit",
+            reservation_terms(order),
         )
         self.ledger.close()
         self.ledger = SQLiteLedger(self.path)
-        first_safety = SafetyController()
+        first_safety = SafetyController(BrokerEnvironment.SIMULATED)
         ExecutionService(
             FakeBroker(BrokerSubmitOutcome.ACKNOWLEDGED),
             self.ledger,
@@ -1166,7 +1789,7 @@ class LedgerAndExecutionTests(unittest.TestCase):
 
         self.ledger.close()
         self.ledger = SQLiteLedger(self.path)
-        safety = SafetyController()
+        safety = SafetyController(BrokerEnvironment.SIMULATED)
         service = ExecutionService(
             FakeBroker(BrokerSubmitOutcome.ACKNOWLEDGED),
             self.ledger,
@@ -1184,9 +1807,7 @@ class LedgerAndExecutionTests(unittest.TestCase):
             "acct",
             client_order_id=order.client_order_id,
         )
-        evidence = UnknownResolutionEvidence(
-            UnknownResolutionResult.CONFIRMED_ABSENT, "broker inquiry", "case-1", NOW
-        )
+        evidence = confirmed_absent()
         with self.assertRaises(TypeError):
             service.resolve_unknown_submission(order.client_order_id, "raw", "raw", ops)
         mismatched_service = operator(safety)
@@ -1228,21 +1849,23 @@ class LedgerAndExecutionTests(unittest.TestCase):
             command_terminal.payload["related_order_id"], order.client_order_id
         )
         self.assertIsNone(command_terminal.payload["related_permit_id"])
-        resolution = self.ledger.events_for(order.client_order_id)[-1]
+        resolution = self.ledger.events_for(order.client_order_id)[-2]
         self.assertEqual(resolution.event_type, "SUBMITTED_UNKNOWN_RESOLVED")
         self.assertEqual(resolution.payload["operator_command_id"], "op-resolve")
         with self.assertRaises(TypeError):
             safety.arm("op-arm", NOW)
         with self.assertRaises(SafetyGuardError):
             safety.complete_reconciliation(
-                snapshot(), market(), "policy-v1", "deploy-v1", NOW
+                snapshot_value := snapshot(), market(),
+                reservation_account_state(snapshot_value), reservation_policy(),
+                "policy-v1", "deploy-v1", NOW,
             )
         with self.assertRaises(InvalidPermit):
             new_order_permit(safety)
 
         self.ledger.close()
         self.ledger = SQLiteLedger(self.path)
-        restarted_safety = SafetyController()
+        restarted_safety = SafetyController(BrokerEnvironment.SIMULATED)
         ExecutionService(
             FakeBroker(BrokerSubmitOutcome.ACKNOWLEDGED),
             self.ledger,
@@ -1264,16 +1887,18 @@ class LedgerAndExecutionTests(unittest.TestCase):
             )
         )
         restarted_safety.complete_reconciliation(
-            snapshot(), market(), "policy-v1", "deploy-v1", NOW
+            snapshot_value := snapshot(), market(),
+            reservation_account_state(snapshot_value), reservation_policy(),
+            "policy-v1", "deploy-v1", NOW,
         )
         restarted_ops.arm(command(restarted_safety, OperatorAction.ARM, "op-arm"))
         self.assertEqual(restarted_safety.state, SafetyState.TRADING)
 
     def test_unknown_resolution_write_failure_keeps_blocker(self):
-        safety = SafetyController()
+        safety = reconciled_safety()
         service = self.service(BrokerSubmitOutcome.UNKNOWN, safety=safety)
         order = request("resolution-failure")
-        service.submit(order, risk(), plan(), intent())
+        submit(service, order, risk(), plan(), intent())
 
         def fail_resolution(*unused_args):
             raise LedgerPersistenceError("resolution write failed")
@@ -1287,9 +1912,7 @@ class LedgerAndExecutionTests(unittest.TestCase):
             "acct",
             client_order_id=order.client_order_id,
         )
-        evidence = UnknownResolutionEvidence(
-            UnknownResolutionResult.CONFIRMED_ABSENT, "broker inquiry", "case-2", NOW
-        )
+        evidence = confirmed_absent()
         with self.assertRaises(OperatorPersistenceFailure):
             service.resolve_unknown_submission(
                 order.client_order_id, resolve_command, evidence, ops
@@ -1303,10 +1926,10 @@ class LedgerAndExecutionTests(unittest.TestCase):
         )
 
     def test_future_unknown_evidence_records_failed_and_keeps_blocker(self):
-        safety = SafetyController()
+        safety = reconciled_safety()
         service = self.service(BrokerSubmitOutcome.UNKNOWN, safety=safety)
         order = request("future-evidence")
-        service.submit(order, risk(), plan(), intent())
+        submit(service, order, risk(), plan(), intent())
         ops = operator(safety, self.ledger)
         resolution = command(
             safety,
@@ -1315,12 +1938,7 @@ class LedgerAndExecutionTests(unittest.TestCase):
             "acct",
             client_order_id=order.client_order_id,
         )
-        evidence = UnknownResolutionEvidence(
-            UnknownResolutionResult.CONFIRMED_ABSENT,
-            "future broker inquiry",
-            "future-case",
-            NOW + timedelta(seconds=1),
-        )
+        evidence = confirmed_absent(NOW + timedelta(seconds=1))
         with self.assertRaises(OperatorCommandRejected):
             service.resolve_unknown_submission(order.client_order_id, resolution, evidence, ops)
         self.assertIn(f"SUBMITTED_UNKNOWN:{order.client_order_id}", safety.blockers)

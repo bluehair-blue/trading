@@ -1,27 +1,37 @@
 # 개인용 알고리즘 트레이딩 시스템
 
-> Architecture baseline v0.2 — 2026-08-25
+> Architecture baseline v0.3 — 2026-08-27
 
 이 문서는 변경 비용이 큰 경계를 먼저 고정하고, 각 단계에서 필요한 코드만 추가하는 구현 기준선이다. 빈 골격과 선제적 인프라는 만들지 않는다.
 
-구현 상태는 **Phase 1B-A 로컬 운영 무결성 경계 완료**다. 이번 Phase 1B-B1 증분은 계좌
-별칭 기반 프로세스 단일 실행 잠금과 주문 제출 안전성 경계를 추가했다. 적용 약관과 운영
-통제는 [키움 Open API 약관 검토](docs/TERMS_REVIEW.md)에 기록한다. 현재 코드에는 키움
-네트워크 연동과 실전·모의 주문이 없다. B1은 실거래 준비나 승인을 의미하지 않는다.
+구현 상태는 **Phase 1B-B1 공통 주문 안전 경계, Phase 1B-B2 read-only 계약, Phase 1C
+시뮬레이터 기반**까지다. 계좌별 프로세스 잠금, 저장소가 강제하는 제출 상태기계, 모든
+환경의 단일 주문 경로와 permit 소비, risk reservation, 구조화 계좌 관측·대사, 단일
+WebSocket supervisor, 계층형 rate limit, no-retry mutation 분류기, typed UNKNOWN 증거,
+allocator와 재현 manifest를 구현했다. 적용 약관과 운영 통제는
+[키움 Open API 약관 검토](docs/TERMS_REVIEW.md)에 기록한다.
+
+중요한 경계가 있다. 현재 키움 코드는 주입된 transport와 합성 응답으로 검증한 독립
+구현이며 실제 자격증명이나 실전·모의 네트워크를 사용하지 않았다. 실제 주문·취소 URL과
+요청 builder도 연결하지 않았다. 따라서 이 체크포인트는 paper/live 주문 준비나 승인을
+의미하지 않는다. 시작·UNKNOWN·장애·복원 절차는 [운영 안전 절차](docs/OPERATIONS.md)를
+따른다.
 
 B1의 프로세스 잠금은 계좌 별칭을 SHA-256으로 파생한 파일명에만 사용하고, 플랫폼별
 비차단 배타 잠금을 획득한다. 잠금은 임의 디렉터리가 아니라 ledger runtime identity와
-계좌 별칭에 결합된다. 향후 composition root는 이 잠금을 토큰·WebSocket·브로커 초기화보다
-먼저 획득해야 한다. `ExecutionService`와 `OperatorCommandService`는 모두 `account_id`로
+계좌 별칭에 결합된다. `bootstrap_runtime()`은 이 잠금을 ledger 검증, token health,
+WebSocket, broker 조회보다 먼저 획득한다. `ExecutionService`와 `OperatorCommandService`는 모두 `account_id`로
 scope된다. 모든 `OperatorCommand`는 `account_id`를 필수로 하며, global broadcast
 coordinator가 없으므로 전역 명령을 허용하지 않는다. LIVE `ExecutionService`는 비어 있지
 않은 `account_id`와 해당 계좌에 일치하는 acquired lock을 필수로 요구하며, account-scoped
 startup recovery와 submit 전체 mutation(예약·브로커 호출·terminal 기록) 동안 그 lock을
 유지한다.
 
-`SQLite` 스키마는 `PRAGMA user_version` 기준 `7`이며, DB 경계에서 `PREPARED ->
+`SQLite` 스키마는 `PRAGMA user_version` 기준 `10`이며, DB 경계에서 `PREPARED ->
 SUBMISSION_STARTED -> ACKNOWLEDGED | SUBMISSION_REJECTED | SUBMITTED_UNKNOWN` 제출 FSM을
-강제한다.
+강제한다. reservation과 permit 소비도 주문 시작과 원자적으로 저장한다. UNKNOWN 해소는
+정책·capability·영업일·조회 시간창·완전한 pagination·정규화 후보 membership을 가진 typed
+evidence만 허용하며 reopen 때 파생 hash까지 다시 계산한다.
 
 ## 1. 범위와 결정 상태
 
@@ -45,12 +55,12 @@ SUBMISSION_STARTED -> ACKNOWLEDGED | SUBMISSION_REJECTED | SUBMITTED_UNKNOWN` �
 
 - 전략, 보유 기간, 시간 프레임, 종목 유니버스
 - 데이터 공급원과 데이터 라이선스
-- 목표 포지션의 단위와 리밸런싱 주기, 전략별 주문·포지션 소유권
-- 주문 정정·취소 정책과 `SUBMITTED_UNKNOWN` 운영자 해소 기한
+- 목표 포지션의 실제 한도와 리밸런싱 주기, 전략별 capital·turnover budget
+- 주문 정정 정책과 `SUBMITTED_UNKNOWN` 운영자 해소 기한
 - 환전 정책, PnL 기준 통화, 비용·환율 귀속 기준
 - 거래 캘린더 공급원, 데이터 정정, 기업행동 처리 정책
 - 손실, 포지션, 회전율, 유동성 한도의 실제 값
-- 클라우드 사업자, 리전, 알림 채널, 감사 보존 기간과 배포 롤백 정책
+- 클라우드 사업자, 리전, 알림 채널, 감사 보존 기간·암호화·off-host backup과 배포 롤백 정책
 
 Phase 1A의 실행 계약은 의도적인 보수적 기본값으로 `long-only`, 정수 주식, 정규장, `LIMIT DAY`만 허용한다. 공매도·신용·소수점·연장시간·다른 주문 유형은 지원 범위가 확정되고 별도 불변식과 테스트가 추가되기 전까지 거절한다.
 
@@ -104,7 +114,7 @@ MarketData Adapter ──> MarketEvent ──> Eligibility Risk
                                            │
                                            v
                                       OrderRequest
-                                           │ + 유효한 TradingPermit(live)
+                                           │ + 환경이 일치하는 유효한 TradingPermit
                                            v
                                       OrderManager
                                            │
@@ -145,7 +155,7 @@ entrypoints -> application -> domain
 | `application` | 목표-현재 차이 계산, 실행 계획, 주문 제출, 안전 제어, 운영자 명령, 대사 조정 | HTTP/SQL 직접 호출, 전략 규칙 복제 |
 | `ports` | 외부 부작용, 실행 모드 교체, 결정론적 테스트가 필요한 경계의 최소 계약 | 내부 구현 세부사항 추상화 |
 | `adapters/kiwoom` | 인증, REST, WebSocket, 유량 제어, 키움↔도메인 매핑 | 전략·리스크 판단 |
-| `adapters/simulated` | FakeBroker, 체결·수수료·슬리피지 모델 | 라이브 전용 분기 |
+| `adapters/simulated` | StubBroker, 결정론적 SimulatedBroker, 체결·수수료·슬리피지 모델 | 라이브 전용 분기 |
 | `adapters/persistence` | 원장과 조회 모델 저장, 트랜잭션 | 주문 정책 |
 | `research` | 백테스트 실험, 로컬 분석, 결과·근거 기록 | Broker 주문 접근, 외부 AI로 키움 원시 시세·계좌·주문·포지션 전송 |
 | `entrypoints` | `backtest`, `paper`, `shadow`, `live` 조립과 최소 운영자 CLI | 도메인 로직 |
@@ -173,7 +183,7 @@ entrypoints -> application -> domain
 | `BrokerOrder` | 존재할 경우 브로커 주문 ID, 관측한 실행 상태, 직교하는 cancel/replace pending action |
 | `Fill` | 고유 체결 ID, 가격, 수량, 수수료, 통화, 체결 시각의 불변 기록 |
 | `AccountSnapshot` | 통화별 결제/미결제 현금, buying power, 포지션, 미체결, 비용·환율과 구성요소별 관측 정보 |
-| `TradingPermit` | live 주문에 필요한 계좌·행위 범위·안전 epoch·스냅숏·정책·만료가 묶인 능력 객체 |
+| `TradingPermit` | 모든 환경에서 필요한 계좌·환경·행위 범위·안전 epoch·스냅숏·정책·만료가 묶인 능력 객체 |
 | `OperatorCommand` | 명령 ID, 행위자, 사유, 이전·결과 상태, 배포 버전과 요청·완료 시각 |
 | `LedgerEntry` | 순번, 이벤트 종류, 내부/브로커 ID, 발생·기록 시각, 원본 참조 |
 | `RunManifest` | 코드·전략·설정·데이터·비용 모델 버전과 실행 기간 |
@@ -230,7 +240,7 @@ NONE -> CANCEL_REQUESTED / REPLACE_REQUESTED -> NONE
 
 | 모드 | 시장 데이터 | 브로커 | 외부 주문 | 용도 |
 |---|---|---|---|---|
-| `fake` | 테스트 입력 | 인메모리 FakeBroker | 불가 | 단위·안전 테스트 |
+| `fake` | 테스트 입력 | 인메모리 StubBroker | 불가 | 단위·안전 테스트 |
 | `backtest` | 과거 데이터 + 가상 시계 | SimulatedBroker | 불가 | 전략·비용·편향 검증 |
 | `paper` | 키움 모의 REST/WS | 키움 모의 계정 | 모의만 | API 계약·체결 흐름 검증 |
 | `shadow` | 실시간 데이터 | SimulatedBroker | 불가 | 실제 시장에서 의사결정·괴리 측정 |
@@ -238,9 +248,10 @@ NONE -> CANCEL_REQUESTED / REPLACE_REQUESTED -> NONE
 
 모드별로 전략 코드를 복사하지 않는다. 조립되는 `Clock`, `TradingCalendar`, `MarketData`,
 `Broker`, `Ledger` 어댑터만 바꾼다. 실전/모의는 URL뿐 아니라 자격증명 묶음 전체를 분리한다.
-`TradingPermit`은 live에서만 필요하며 다른 모드의 성공이 실전 권한을 암묵적으로 만들지 않는다.
-`fake`·`backtest`·`shadow`의 Fake/Simulated Broker 경로는 permit 없이 동작하며, 이 경로의
-성공은 live permit을 만들지 않는다.
+`TradingPermit` 검증, market/account evidence, risk reservation, `OrderCoordinator`는 모든
+환경에서 같은 경로를 사용한다. permit은 환경에 결속되므로 simulated 또는 paper 성공이
+live 권한을 암묵적으로 만들지 않는다. 고정 결과 단위 테스트는 `StubBroker`, latency·부분
+체결·spread·slippage·fee·DAY 만료·cancel race·기업행동 halt는 `SimulatedBroker`가 담당한다.
 
 ## 7. 라이브 안전 상태
 
@@ -267,12 +278,14 @@ BOOTSTRAPPING -> RECONCILING -> READY --명시적 arm--> TRADING
 모든 조건을 통과하면 SafetyController가 짧은 수명의 `TradingPermit`을 발급한다. permit은
 `permit_id`, 계좌, 허용 행위, 안전 상태 epoch, account/market snapshot ID, 위험 정책·배포
 버전, 발급·만료 시각을 포함한다. `NEW_ORDER` permit은 추가로 정확한 `client_order_id`,
-`risk_decision_id`, `execution_plan_id`에 결속된다. live `OrderManager`는 해당 행위 범위의
-유효한 permit 없이는 submit/cancel/reduce 명령을 호출할 수 없다. 상태 전이, 대사 실패, 데이터
+`risk_decision_id`, `execution_plan_id`에 결속된다. 모든 환경의 `OrderCoordinator`는 해당
+행위 범위의 유효한 permit 없이는 submit을 호출할 수 없다. 상태 전이, 대사 실패, 데이터
 품질 저하, 배포 변경 시 기존 permit은 즉시 무효다. `NEW_ORDER` permit은 주문 예약과 함께
 원장에 내구적으로 단 한 번만 소비되며 다른 주문에 재사용할 수 없다. `HALTED`에서는
-SafetyController가 취소 전용 permit을 새로 발급할 수 있고, 축소·청산 permit은 운영자 승인까지
-확인한 뒤에만 발급한다.
+SafetyController가 exact `CancelOrderCommand`에 묶인 짧은 수명의 `CancelPermit`을 새로
+발급할 수 있고, 축소·청산 permit은 운영자 승인까지 확인한 뒤에만 발급한다. 현재 typed
+cancel service는 permit을 broker I/O 전에 메모리에서 한 번 소비하고 단일 호출만 수행한다.
+영구 attempt 기록과 crash/restart 복구가 없으므로 실제 paper/live 취소에는 아직 사용하지 않는다.
 
 다음 조건에서는 fail-closed로 신규 주문을 막고 `HALTED`로 이동한다.
 
@@ -310,8 +323,9 @@ SafetyController가 취소 전용 permit을 새로 발급할 수 있고, 축소�
 
 안전 명령의 `REDUCE_ONLY` permit은 모든 상태에서 운영자 승인이 필요하며, 전략이 정상적으로 기존 long 포지션을 축소하는 SELL은 `NEW_ORDER` permit과 일반 pre-trade risk 경로를 사용한다.
 
-목표 운영 제어면은 별도 대시보드가 아닌 최소 CLI다. Phase 1B-A에는 CLI를 구현하지
-않았으며, 후속 CLI는 `status`, `arm`, `disarm`, `halt`, `reconcile`, `cancel-open`,
+목표 운영 제어면은 별도 대시보드가 아닌 최소 CLI다. 현재는 감사되는 내부
+`OperatorCommandService`까지만 구현했으며, 후속 authenticated OS-user CLI는 `status`,
+`arm`, `disarm`, `halt`, `reconcile`, `cancel-open`,
 `reduce-only`, `emergency-flatten` 계약을 제공해야 한다. 원장이 정상일 때 모든 요청은
 실행 전에 `OperatorCommand`로 기록한다. 기록에는 `operator_command_id`, 인증된 행위자,
 사유, 이전 상태, 요청 시각, 배포 버전을 포함하고 완료 후 결과 상태와 오류·관련
@@ -335,6 +349,14 @@ permit/order ID를 새 이벤트로 추가한다. 두 상관관계 필드는 항
 - `Mapper`: 키움 TR/FID와 도메인 계약 사이 변환, 관측 ID·sequence·품질 표시 부여
 - `Reconciler`: REST 응답, WebSocket 주문·체결 이벤트, 계좌 조회 통합
 
+현재 독립 구현은 credential profile/token health, `ust21070`·`ust21110`·`ust21150` tolerant
+reader와 complete pagination, raw response hash, 구조화 `AccountObservation`, 대사 report,
+단일 session·200종목 제한을 가진 WebSocket supervisor, reconnect 후 REST 대사 gate,
+versioned hierarchical rate scheduler를 제공한다. 필수 필드·타입·중복 JSON key는 거절하고
+알 수 없는 추가 필드는 허용한다. mutation client는 auth refresh나 자동 retry 없이 주입된
+요청을 정확히 한 번만 보내고, HTTP·JSON·`return_code == 0`·비어 있지 않은 `ord_no`와
+원문 저장을 모두 만족해야 ACK로 분류한다.
+
 단일 프로세스 안에서도 이벤트 중요도를 분리한다.
 
 - 주문·체결·계좌 사실, 운영자 명령, permit 무효화, `ContinuousRisk`·킬 스위치 동작, reconciliation은 loss-intolerant control lane으로 처리하며 임의로 drop·coalesce하지 않는다.
@@ -353,6 +375,8 @@ permit/order ID를 새 이벤트로 추가한다. 두 상관관계 필드는 항
 - OAuth Client Credentials 토큰 유효기간은 24시간이다.
 - 미국주식은 계좌·토큰별 일반 시간 주문 10회/초, 조회 5회/초, 환전 1회/초다.
 - KST 09:00~10:00에는 주문 3회/초, 조회 3회/초, 환전 1회/초다.
+- 미국주식 전체 50회/초, 차트 20회/초, `usa10099`는 5회/분이며 모의투자는 동일 TR
+  1회/초 제한을 함께 적용한다.
 - 계좌·토큰별 세션 1개, 세션당 실시간 시세 200종목 제한이 있다.
 - 모의 미국주식은 별도 참가 신청이 필요하다.
 
@@ -360,9 +384,9 @@ permit/order ID를 새 이벤트로 추가한다. 두 상관관계 필드는 항
 
 키움 문서에서 주문용 멱등성 키, 안전한 자동 재시도, `Retry-After` 계약은 확인되지 않았다. 따라서 `client_order_id`는 내부 중복 방지 키로만 사용한다. 네트워크 타임아웃이 난 주문을 즉시 재전송하지 않고 `SUBMITTED_UNKNOWN`으로 기록한 뒤 미체결·체결 조회와 WebSocket 이벤트로 먼저 대사한다.
 
-이번 B1에는 Kiwoom read-only/live adapter, 모든 실행 모드가 공유할 common-mode safety path,
-monotonic clock, coordinator와 risk reservation을 구현하지 않았다. 이 항목들은 후속 구현
-계약이다.
+현재 구현은 실제 키움 endpoint를 호출해 검증한 결과가 아니다. 실제 credential과 네트워크를
+연결하기 전 공식 계약 snapshot을 다시 확인하고, paper 환경에서 complete pagination,
+WebSocket disconnect, timeout·401·malformed response와 crash/restart 대사를 별도로 증명한다.
 
 ## 9. 원장과 대사
 
@@ -371,17 +395,21 @@ monotonic clock, coordinator와 risk reservation을 구현하지 않았다. 이 
 ```text
 1. StrategyDecision -> PositionTarget -> TradeIntent 기록
 2. RiskDecision과 ExecutionPlan 기록
-3. TradingPermit 검증 후 고유 client_order_id의 OrderRequest와 PREPARED,
-   SUBMISSION_STARTED를 하나의 원자적 DB 트랜잭션으로 예약·commit
+3. TradingPermit 검증 후 고유 client_order_id, permit 소비, cash·exposure·sell quantity
+   risk reservation, OrderRequest, PREPARED, SUBMISSION_STARTED를 하나의 원자적 DB
+   트랜잭션으로 예약·commit
 4. DB 트랜잭션 밖에서 키움 주문 전송
 5. 새 트랜잭션으로 ACKNOWLEDGED, 확정적 SUBMISSION_REJECTED 또는 SUBMITTED_UNKNOWN 기록
 6. WebSocket 주문·체결 이벤트와 REST 조회로 BrokerExecution 확정
-7. LedgerEntry와 현금·포지션 projection을 같은 트랜잭션으로 반영
+7. Broker observation과 reconciliation 결과를 기록한다. 영구 cash·position 회계
+   projection은 회계 정책을 확정한 뒤 추가한다.
 ```
 
 - 원장은 append-only 감사 기록이며 원장 저장 API에는 `UPDATE/DELETE`가 없다. DB가 권한을 지원하면 애플리케이션 계정에서도 이를 제거하고, SQLite에서는 보호 trigger와 회귀 테스트로 강제한다. 오류 수정은 원본을 참조하는 정정 이벤트만 추가한다.
 - 각 원장 이벤트와 그로부터 파생되는 projection 갱신은 하나의 DB 트랜잭션으로 commit한다. 외부 API 호출을 DB 트랜잭션 안에서 기다리지 않는다.
 - `client_order_id`, scoped `broker_order_id`, scoped `broker_execution_id`, `event_id`, `operator_command_id`의 고유성은 DB 제약으로도 강제한다.
+- reservation은 ACK·UNKNOWN에서는 유지하고 확정 거절 또는 완전한 조회로 증명한
+  `CONFIRMED_ABSENT`에서만 원자적으로 해제한다.
 - 수량 partition 불변식과 허용된 내부·브로커 상태 전이는 저장 전에 검사하고 replay/restore 후 다시 검증한다.
 - 재시작 시 미완료 제출을 스캔한다. 마지막 이벤트가 `SUBMISSION_STARTED`면 실제 전송 여부와 관계없이 `SUBMITTED_UNKNOWN` 이벤트를 추가하고 자동 재전송하지 않는다.
 - 브로커 주문 ID나 체결을 확정적으로 연결할 수 없는 불확정 주문은 운영자가 해소할 때까지 `HALTED`를 유지한다.
@@ -410,7 +438,7 @@ monotonic clock, coordinator와 risk reservation을 구현하지 않았다. 이 
 
 ```text
 로컬 PC
-  개발 / 테스트 / 백테스트 / FakeBroker
+  개발 / 테스트 / 백테스트 / StubBroker / SimulatedBroker
 
 단일 Linux VPS
   trading process + single-writer ledger + systemd + 외부 백업
@@ -461,46 +489,51 @@ tests/
 - backup restore, 원장 replay, projection 일치, schema migration, 디스크 full 시 자동 명령 금지·수동 복구 테스트
 - CI는 실전 자격증명·실전 주문 엔드포인트를 차단하고 금지 import와 `research -> live order port` 의존을 검사한다. 초기에는 별도 도구보다 표준 라이브러리 AST 검사로 충분하다.
 
-현재 Phase 1B-A 검증 명령:
+현재 검증 명령:
 
 ```powershell
-$env:PYTHONPATH = (Resolve-Path 'src').Path
-python -m compileall -q src tests
-python -m unittest discover -s tests -p 'test_*.py'
-python -m ruff check src tests
-python -m pip check
+uv sync --locked --dev
+uv lock --check
+uv run python scripts/verify.py
 ```
 
-이번 B1 변경 기준 `python -m unittest discover -s tests -p 'test_*.py'` 검증 결과는 106개 테스트 통과다.
+`verify.py`는 임시 디렉터리의 branch coverage 데이터와 bytecode cache를 사용하며,
+compileall, 전체 unittest, coverage floor 70%, Ruff, repository secret scan,
+`uv pip check --python <현재 인터프리터>`를 fail-fast로 실행한다. GitHub Actions는
+Ubuntu와 Windows에서 locked development environment를 다시 만들고 같은 명령을 실행한다.
+2026-08-27 현재 전체 248개 테스트와 branch coverage 84%가 통과했다.
+전체 `src` mypy에는 현재 실제 오류가 남아 있어 broad ignore나 exclude로 녹색을 가장하지
+않고 type-check gate를 보류했다.
 
-Phase 1B-A는 Phase 1A의 계약·위험·permit·FakeBroker·제출 상태를 보존하면서 versioned
-SQLite migration, audited operator command boundary, typed `SUBMITTED_UNKNOWN` 해소 근거,
-WAL-safe local backup과 isolated restore를 구현했다. 세부 결정과 다음 blocking gate는
+이번 체크포인트는 공통 모드 safety/permit, 저장소가 강제하는 제출 상태, risk reservation,
+구조화 read-only 관측과 대사, 단일 WebSocket supervisor, 계층형 limiter, no-retry mutation
+분류, typed `SUBMITTED_UNKNOWN` 증거, WAL-safe local backup/restore, simulator, allocator와
+research manifest를 구현했다. 세부 결정과 다음 blocking gate는
 [`docs/PHASE1B_DECISIONS.md`](docs/PHASE1B_DECISIONS.md)에 기록한다.
 
-TradingCalendar, 종목별 구조화 reconciliation, 현금·포지션 projection, 운영자 CLI,
-보존·암호화·원격 백업, 실제 broker 조회·취소·축소·청산은 Phase 1B-B 이후로 명시적으로
-보류한다. 현재 unknown 해소 근거는 감사 원장에 보존되지만 broker가 독립 검증했다고
-간주하지 않는다.
+TradingCalendar source, 영구 cash·position accounting projection, 인증된 운영자 CLI,
+보존·암호화·off-host backup, 실제 broker 연결과 주문·정정·취소·축소·청산은 명시적으로
+보류한다. 합성 응답으로 만든 UNKNOWN 증거와 CI 결과를 broker 독립 검증으로 간주하지 않는다.
 
 ## 13. 단계별 구현 게이트
 
 | 단계 | 산출물 | 통과 조건 |
 |---|---|---|
 | 0. 명세 | 이 아키텍처, 전략·주문 의미, 위험·운영 정책 | 아래 Phase 1 blocking 결정이 모두 닫히고 가정과 사실이 구분됨 |
-| 1. 코어 | 도메인 계약, FakeBroker, 원장, 세 위험 단계, calendar/permit/operator control | 상태·불변식·안전 단위 테스트 통과 |
+| 1. 코어 | 도메인 계약, StubBroker, 원장, 세 위험 단계, calendar/permit/operator control | 상태·불변식·안전 단위 테스트 통과 |
 | 2. 백테스트 | 비용·슬리피지, 편향 방지, RunManifest | 홀드아웃·워크포워드 재현 가능 |
 | 3. 읽기 전용 | 키움 인증, 시세, 계좌, WebSocket | 장시간 실행·재연결·대사 통과 |
 | 4. 모의 주문 | 주문·정정·취소·부분체결 | 중복·타임아웃·재시작 테스트 통과 |
 | 5. 섀도 | 실제 시세 + 가상 체결 | 예상/실제 가능 체결 괴리 측정 |
 | 6. 제한 실전 | 최소 금액과 강한 한도 | 운영 기간 동안 안전 위반 없음 |
 
-다음 단계는 Phase 1B의 운영 안전 기능을 완성하는 것이다. 아래 결정 중 해당 기능의 계약을 바꾸는 항목은 구현 전에 닫고, 전략·백테스트에만 필요한 항목은 Phase 2 진입 전까지 확정한다.
+다음 단계는 실제 endpoint를 추가하는 일이 아니라 아래 운영·회계 결정을 닫고 paper
+read-only 장시간 검증을 수행하는 것이다.
 
 1. 미국 현물주식 대상 확정
-2. 전략·보유 기간·유니버스와 `PositionTarget` 단위·리밸런싱 주기·전략별 소유권
+2. 전략·보유 기간·유니버스와 `PositionTarget` 단위·리밸런싱 주기·전략별 실제 budget
 3. 세 위험 단계의 한도, 미체결 위험, 킬 스위치 자동/수동 범위와 승격 기준
-4. long/short, 가격·수량 반올림, 주문 유형·TIF·정정·취소, 거래 세션 범위
+4. long/short, 가격·수량 반올림, 주문 유형·TIF·정정, 거래 세션 범위
 5. `SUBMITTED_UNKNOWN` 조사·운영자 해소 기한과 중복 의심 주문 처리
 6. TradingCalendar·시장 데이터 출처, 정정·누락·기업행동 정책
 7. PnL 기준 통화, 환율 시점, 수수료·세금·슬리피지 귀속 기준
