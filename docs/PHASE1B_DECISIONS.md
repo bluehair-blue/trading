@@ -29,7 +29,36 @@
   Restore verifies one immutable byte snapshot into a new isolated destination, rejects existing
   SQLite sidecars, and uses the same exclusive no-overwrite rule. After publication it opens and
   rechecks the final database's schema, integrity, sequence, and logical content before returning
-  success. A failed restore artifact is likewise retained for investigation and never auto-deleted.
+  success. A verified v6 backup is migrated in a staged isolated file to the current schema and
+  re-verified before publication. A failed restore artifact is likewise retained for investigation
+  and never auto-deleted.
+
+## Phase 1B-B1 — process lock and submission safety increment
+
+- A cross-platform, non-blocking exclusive process lock is scoped by the ledger runtime identity and
+  internal account alias, not an arbitrary directory. The alias is used only as the input to a
+  SHA-256-derived lock filename; it is not written as raw alias data to the path or lock metadata.
+  The future composition root must acquire this lock before initializing tokens, WebSocket, or
+  broker clients. `ExecutionService` and `OperatorCommandService` are account-scoped. Every
+  `OperatorCommand` requires `account_id`; no global broadcast coordinator exists, so global
+  commands are not allowed. `ExecutionService` additionally requires a non-empty
+  `account_id` and an already acquired lock matching that account; account-scoped startup recovery
+  and the complete submit mutation (reservation, broker call, and terminal record) hold that lock.
+  The composition root and Kiwoom integrations are not implemented by B1.
+- A file-backed WAL SQLite ledger rejects a hard-linked database at open and fails closed without
+  mutating the ledger.
+- SQLite schema version is now `7`, stored in `PRAGMA user_version`. The database enforces the
+  submission state machine `PREPARED -> SUBMISSION_STARTED -> ACKNOWLEDGED | SUBMISSION_REJECTED |
+  SUBMITTED_UNKNOWN`, including the single terminal transition, at the storage boundary and during
+  historical validation.
+- A live `NEW_ORDER` `TradingPermit` is bound exactly to `client_order_id`, `risk_decision_id`, and
+  `execution_plan_id`. The binding is persisted in the immutable order payload and validated before
+  submission. A permit ID has a durable unique constraint across order reservations, so one permit
+  cannot be consumed by a second order.
+- Order reservation, the immutable order request, `PREPARED`, and `SUBMISSION_STARTED` are committed
+  atomically. If any part fails, the order reservation and both submission events roll back together.
+- Fake/Simulated Broker paths remain permitless. Their successful submissions do not issue or imply a live permit.
+- Kiwoom read-only/live adapters, the common-mode safety path, a monotonic clock, coordinator, and risk reservation remain unimplemented follow-up work. This increment does not represent live-trading readiness or approval.
 
 ## Blocking decisions for Phase 1B-B
 

@@ -143,12 +143,24 @@ class SafetyController:
         scope: PermitScope,
         now: datetime,
         *,
+        client_order_id: str | None = None,
+        risk_decision_id: str | None = None,
+        execution_plan_id: str | None = None,
         ttl_seconds: int = 30,
         max_snapshot_age_seconds: int = 30,
     ) -> TradingPermit:
         require_utc(now, "now")
         if scope is not PermitScope.NEW_ORDER or not self._scope_allowed(scope, False):
             raise InvalidPermit(f"scope {scope} is not allowed in {self.state}")
+        try:
+            for name, value in (
+                ("client_order_id", client_order_id),
+                ("risk_decision_id", risk_decision_id),
+                ("execution_plan_id", execution_plan_id),
+            ):
+                require_id(value, name)
+        except ValueError as error:
+            raise InvalidPermit("NEW_ORDER permit requires exact order binding") from error
         if ttl_seconds <= 0:
             raise InvalidPermit("permit TTL must be positive")
         evidence = self.evidence
@@ -167,6 +179,7 @@ class SafetyController:
             raise InvalidPermit("evidence validity has expired")
         permit = TradingPermit(
             str(uuid4()), account_id, scope, self.epoch,
+            client_order_id, risk_decision_id, execution_plan_id,
             evidence.account_snapshot.snapshot_id, evidence.market.snapshot_id,
             evidence.policy_version, evidence.deployment_version, now,
             expires_at,
@@ -196,6 +209,7 @@ class SafetyController:
             expires_at = now + timedelta(seconds=min(ttl_seconds, 30))
             permit = TradingPermit(
                 str(uuid4()), account_id, scope, self.epoch,
+                None, None, None,
                 None, None, None, None, now, expires_at,
             )
             self._issued_permits[permit.permit_id] = (permit, 0)
@@ -216,6 +230,7 @@ class SafetyController:
             raise InvalidPermit("evidence validity has expired")
         permit = TradingPermit(
             str(uuid4()), account_id, scope, self.epoch,
+            None, None, None,
             evidence.account_snapshot.snapshot_id, evidence.market.snapshot_id,
             evidence.policy_version, evidence.deployment_version, now, expires_at,
         )
@@ -223,7 +238,15 @@ class SafetyController:
         return permit
 
     def validate(
-        self, permit: TradingPermit, account_id: str, scope: PermitScope, now: datetime
+        self,
+        permit: TradingPermit,
+        account_id: str,
+        scope: PermitScope,
+        now: datetime,
+        *,
+        client_order_id: str | None = None,
+        risk_decision_id: str | None = None,
+        execution_plan_id: str | None = None,
     ) -> None:
         require_utc(now, "now")
         evidence = self.evidence
@@ -234,6 +257,9 @@ class SafetyController:
             or issued[0] != permit
             or permit.account_id != account_id
             or permit.scope is not scope
+            or permit.client_order_id != client_order_id
+            or permit.risk_decision_id != risk_decision_id
+            or permit.execution_plan_id != execution_plan_id
             or permit.safety_epoch != self.epoch
             or now < permit.issued_at
             or now >= permit.expires_at

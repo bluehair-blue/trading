@@ -466,6 +466,9 @@ class TradingPermit:
     account_id: str
     scope: PermitScope
     safety_epoch: int
+    client_order_id: str | None
+    risk_decision_id: str | None
+    execution_plan_id: str | None
     account_snapshot_id: str | None
     market_snapshot_id: str | None
     policy_version: str | None
@@ -479,6 +482,18 @@ class TradingPermit:
         if self.safety_epoch < 0:
             raise ValueError("safety_epoch cannot be negative")
         require_enum(self.scope, PermitScope, "scope")
+        binding_claims = (
+            self.client_order_id,
+            self.risk_decision_id,
+            self.execution_plan_id,
+        )
+        if self.scope is PermitScope.NEW_ORDER:
+            for name in (
+                "client_order_id", "risk_decision_id", "execution_plan_id",
+            ):
+                require_id(getattr(self, name), name)
+        elif any(value is not None for value in binding_claims):
+            raise ValueError("only NEW_ORDER permits can carry order binding claims")
         evidence_claims = (
             self.account_snapshot_id,
             self.market_snapshot_id,
@@ -512,7 +527,10 @@ class OperatorCommand:
     requested_at: datetime
     expires_at: datetime
     action: OperatorAction
-    account_id: str | None = None
+    account_id: str
+    client_order_id: str | None = None
+    risk_decision_id: str | None = None
+    execution_plan_id: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("command_id", "actor", "reason", "deployment_version"):
@@ -524,8 +542,19 @@ class OperatorCommand:
         require_utc(self.expires_at, "expires_at")
         if self.expires_at <= self.requested_at:
             raise ValueError("operator command must expire after it is requested")
-        if self.account_id is not None:
-            require_id(self.account_id, "account_id")
+        require_id(self.account_id, "account_id")
+        for name in (
+            "client_order_id", "risk_decision_id", "execution_plan_id",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                require_id(value, name)
+        if self.action is OperatorAction.RESOLVE_SUBMITTED_UNKNOWN:
+            require_id(self.client_order_id, "client_order_id")
+            if self.risk_decision_id is not None or self.execution_plan_id is not None:
+                raise ValueError(
+                    "unknown resolution cannot carry risk or plan binding claims"
+                )
 
 
 @dataclass(frozen=True)

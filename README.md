@@ -4,7 +4,24 @@
 
 이 문서는 변경 비용이 큰 경계를 먼저 고정하고, 각 단계에서 필요한 코드만 추가하는 구현 기준선이다. 빈 골격과 선제적 인프라는 만들지 않는다.
 
-구현 상태는 **Phase 1B-A 로컬 운영 무결성 경계 완료**다. 적용 약관과 운영 통제는 [키움 Open API 약관 검토](docs/TERMS_REVIEW.md)에 기록한다. 현재 코드에는 키움 네트워크 연동과 실전·모의 주문이 없다.
+구현 상태는 **Phase 1B-A 로컬 운영 무결성 경계 완료**다. 이번 Phase 1B-B1 증분은 계좌
+별칭 기반 프로세스 단일 실행 잠금과 주문 제출 안전성 경계를 추가했다. 적용 약관과 운영
+통제는 [키움 Open API 약관 검토](docs/TERMS_REVIEW.md)에 기록한다. 현재 코드에는 키움
+네트워크 연동과 실전·모의 주문이 없다. B1은 실거래 준비나 승인을 의미하지 않는다.
+
+B1의 프로세스 잠금은 계좌 별칭을 SHA-256으로 파생한 파일명에만 사용하고, 플랫폼별
+비차단 배타 잠금을 획득한다. 잠금은 임의 디렉터리가 아니라 ledger runtime identity와
+계좌 별칭에 결합된다. 향후 composition root는 이 잠금을 토큰·WebSocket·브로커 초기화보다
+먼저 획득해야 한다. `ExecutionService`와 `OperatorCommandService`는 모두 `account_id`로
+scope된다. 모든 `OperatorCommand`는 `account_id`를 필수로 하며, global broadcast
+coordinator가 없으므로 전역 명령을 허용하지 않는다. LIVE `ExecutionService`는 비어 있지
+않은 `account_id`와 해당 계좌에 일치하는 acquired lock을 필수로 요구하며, account-scoped
+startup recovery와 submit 전체 mutation(예약·브로커 호출·terminal 기록) 동안 그 lock을
+유지한다.
+
+`SQLite` 스키마는 `PRAGMA user_version` 기준 `7`이며, DB 경계에서 `PREPARED ->
+SUBMISSION_STARTED -> ACKNOWLEDGED | SUBMISSION_REJECTED | SUBMITTED_UNKNOWN` 제출 FSM을
+강제한다.
 
 ## 1. 범위와 결정 상태
 
@@ -219,7 +236,11 @@ NONE -> CANCEL_REQUESTED / REPLACE_REQUESTED -> NONE
 | `shadow` | 실시간 데이터 | SimulatedBroker | 불가 | 실제 시장에서 의사결정·괴리 측정 |
 | `live` | 키움 실전 REST/WS | 키움 실전 계정 | 명시적 잠금 해제 시만 | 제한 실전 |
 
-모드별로 전략 코드를 복사하지 않는다. 조립되는 `Clock`, `TradingCalendar`, `MarketData`, `Broker`, `Ledger` 어댑터만 바꾼다. 실전/모의는 URL뿐 아니라 자격증명 묶음 전체를 분리한다. `TradingPermit`은 live에서만 필요하며 다른 모드의 성공이 실전 권한을 암묵적으로 만들지 않는다.
+모드별로 전략 코드를 복사하지 않는다. 조립되는 `Clock`, `TradingCalendar`, `MarketData`,
+`Broker`, `Ledger` 어댑터만 바꾼다. 실전/모의는 URL뿐 아니라 자격증명 묶음 전체를 분리한다.
+`TradingPermit`은 live에서만 필요하며 다른 모드의 성공이 실전 권한을 암묵적으로 만들지 않는다.
+`fake`·`backtest`·`shadow`의 Fake/Simulated Broker 경로는 permit 없이 동작하며, 이 경로의
+성공은 live permit을 만들지 않는다.
 
 ## 7. 라이브 안전 상태
 
@@ -243,7 +264,15 @@ BOOTSTRAPPING -> RECONCILING -> READY --명시적 arm--> TRADING
 - 시계 동기화, TradingCalendar, 시세 최신성·연속성 검사를 통과했다.
 - 인증, REST, WebSocket, 저장소가 정상이다.
 
-모든 조건을 통과하면 SafetyController가 짧은 수명의 `TradingPermit`을 발급한다. permit은 `permit_id`, 계좌, 허용 행위, 안전 상태 epoch, account/market snapshot ID, 위험 정책·배포 버전, 발급·만료 시각을 포함한다. live `OrderManager`는 해당 행위 범위의 유효한 permit 없이는 submit/cancel/reduce 명령을 호출할 수 없다. 상태 전이, 대사 실패, 데이터 품질 저하, 배포 변경 시 기존 permit은 즉시 무효다. `HALTED`에서는 SafetyController가 취소 전용 permit을 새로 발급할 수 있고, 축소·청산 permit은 운영자 승인까지 확인한 뒤에만 발급한다.
+모든 조건을 통과하면 SafetyController가 짧은 수명의 `TradingPermit`을 발급한다. permit은
+`permit_id`, 계좌, 허용 행위, 안전 상태 epoch, account/market snapshot ID, 위험 정책·배포
+버전, 발급·만료 시각을 포함한다. `NEW_ORDER` permit은 추가로 정확한 `client_order_id`,
+`risk_decision_id`, `execution_plan_id`에 결속된다. live `OrderManager`는 해당 행위 범위의
+유효한 permit 없이는 submit/cancel/reduce 명령을 호출할 수 없다. 상태 전이, 대사 실패, 데이터
+품질 저하, 배포 변경 시 기존 permit은 즉시 무효다. `NEW_ORDER` permit은 주문 예약과 함께
+원장에 내구적으로 단 한 번만 소비되며 다른 주문에 재사용할 수 없다. `HALTED`에서는
+SafetyController가 취소 전용 permit을 새로 발급할 수 있고, 축소·청산 permit은 운영자 승인까지
+확인한 뒤에만 발급한다.
 
 다음 조건에서는 fail-closed로 신규 주문을 막고 `HALTED`로 이동한다.
 
@@ -331,6 +360,10 @@ permit/order ID를 새 이벤트로 추가한다. 두 상관관계 필드는 항
 
 키움 문서에서 주문용 멱등성 키, 안전한 자동 재시도, `Retry-After` 계약은 확인되지 않았다. 따라서 `client_order_id`는 내부 중복 방지 키로만 사용한다. 네트워크 타임아웃이 난 주문을 즉시 재전송하지 않고 `SUBMITTED_UNKNOWN`으로 기록한 뒤 미체결·체결 조회와 WebSocket 이벤트로 먼저 대사한다.
 
+이번 B1에는 Kiwoom read-only/live adapter, 모든 실행 모드가 공유할 common-mode safety path,
+monotonic clock, coordinator와 risk reservation을 구현하지 않았다. 이 항목들은 후속 구현
+계약이다.
+
 ## 9. 원장과 대사
 
 주문 경로는 다음 순서를 지킨다.
@@ -338,12 +371,12 @@ permit/order ID를 새 이벤트로 추가한다. 두 상관관계 필드는 항
 ```text
 1. StrategyDecision -> PositionTarget -> TradeIntent 기록
 2. RiskDecision과 ExecutionPlan 기록
-3. 고유 client_order_id의 OrderRequest와 PREPARED 이벤트 기록
-4. TradingPermit 검증 후 SUBMISSION_STARTED 이벤트를 commit
-5. DB 트랜잭션 밖에서 키움 주문 전송
-6. 새 트랜잭션으로 ACKNOWLEDGED, 확정적 SUBMISSION_REJECTED 또는 SUBMITTED_UNKNOWN 기록
-7. WebSocket 주문·체결 이벤트와 REST 조회로 BrokerExecution 확정
-8. LedgerEntry와 현금·포지션 projection을 같은 트랜잭션으로 반영
+3. TradingPermit 검증 후 고유 client_order_id의 OrderRequest와 PREPARED,
+   SUBMISSION_STARTED를 하나의 원자적 DB 트랜잭션으로 예약·commit
+4. DB 트랜잭션 밖에서 키움 주문 전송
+5. 새 트랜잭션으로 ACKNOWLEDGED, 확정적 SUBMISSION_REJECTED 또는 SUBMITTED_UNKNOWN 기록
+6. WebSocket 주문·체결 이벤트와 REST 조회로 BrokerExecution 확정
+7. LedgerEntry와 현금·포지션 projection을 같은 트랜잭션으로 반영
 ```
 
 - 원장은 append-only 감사 기록이며 원장 저장 API에는 `UPDATE/DELETE`가 없다. DB가 권한을 지원하면 애플리케이션 계정에서도 이를 제거하고, SQLite에서는 보호 trigger와 회귀 테스트로 강제한다. 오류 수정은 원본을 참조하는 정정 이벤트만 추가한다.
@@ -386,6 +419,7 @@ permit/order ID를 새 이벤트로 추가한다. 두 상관관계 필드는 항
 - 클라우드는 장시간 모의·섀도 운용 전까지 구매하지 않는다.
 - VPS는 고정 송신 IPv4, NTP, 자동 재시작, 디스크·프로세스 모니터링을 갖춘다.
 - 단일 프로세스 단계에서는 SQLite를 기본 후보로 둔다. live 사용 시 single writer, 명시적 트랜잭션, foreign key, 내구성 설정, WAL 적합성 검증, versioned schema migration, 일관된 backup API를 운영 계약으로 둔다.
+- 파일 기반 WAL SQLite ledger는 hard link가 확인되면 open 단계에서 fail-closed로 거부하며 ledger를 변경하지 않는다.
 - 백업 파일이 존재하는지만 보지 않고 정기 restore·원장 replay·무결성 검사를 통과해야 한다. 디스크 full, commit 실패, integrity 실패는 즉시 `DISARM/HALTED`다.
 - 동시 쓰기, 원격 조회, 대기 서버가 실제 요구가 될 때 같은 persistence 계약을 유지하며 PostgreSQL로 옮긴다.
 - Docker, Redis, 메시지 브로커, 별도 대시보드 서비스는 측정된 필요가 생기기 전에는 추가하지 않는다.
@@ -436,6 +470,8 @@ python -m unittest discover -s tests -p 'test_*.py'
 python -m ruff check src tests
 python -m pip check
 ```
+
+이번 B1 변경 기준 `python -m unittest discover -s tests -p 'test_*.py'` 검증 결과는 106개 테스트 통과다.
 
 Phase 1B-A는 Phase 1A의 계약·위험·permit·FakeBroker·제출 상태를 보존하면서 versioned
 SQLite migration, audited operator command boundary, typed `SUBMITTED_UNKNOWN` 해소 근거,

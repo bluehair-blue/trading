@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import tempfile
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -23,9 +24,10 @@ from trader.ports.ledger import (
     LedgerPersistenceError,
     OperatorCommandConflict,
     OrderReservationConflict,
+    PermitAlreadyConsumed,
 )
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 TERMINAL_EVENTS = {
     OperatorCommandOutcome.SUCCEEDED: "OPERATOR_COMMAND_SUCCEEDED",
     OperatorCommandOutcome.FAILED: "OPERATOR_COMMAND_FAILED",
@@ -84,10 +86,14 @@ V3_OBJECTS = V1_OBJECTS | {
     "operator_terminal_contract",
     "unknown_resolution_contract",
 }
-CURRENT_OBJECTS = V3_OBJECTS | {
+V6_OBJECTS = V3_OBJECTS | {
     "schema_metadata",
     "schema_metadata_no_update",
     "schema_metadata_no_delete",
+}
+CURRENT_OBJECTS = V6_OBJECTS | {
+    "order_request_permit_once",
+    "submission_state_contract",
 }
 TABLE_COLUMNS = {
     "ledger_events": (
@@ -352,6 +358,78 @@ V6_STATEMENTS = (
     "DROP TRIGGER unknown_resolution_contract",
     V6_RESOLUTION_SQL,
 )
+V7_RESOLUTION_SQL = V6_RESOLUTION_SQL.replace(
+    "AND json_extract(command.canonical_json, '$.action') =\n"
+    "                  'RESOLVE_SUBMITTED_UNKNOWN'",
+    "AND json_extract(command.canonical_json, '$.action') =\n"
+    "                  'RESOLVE_SUBMITTED_UNKNOWN'\n"
+    "                AND json_type(command.canonical_json, '$.client_order_id') = 'text'\n"
+    "                AND json_extract(command.canonical_json, '$.client_order_id') =\n"
+    "                  NEW.aggregate_id",
+)
+V7_TERMINAL_SQL = V5_TERMINAL_SQL.replace(
+    "OR NOT EXISTS (SELECT 1 FROM operator_commands\n"
+    "              WHERE command_id = NEW.aggregate_id)",
+    "OR NOT EXISTS (SELECT 1 FROM operator_commands\n"
+    "              WHERE command_id = NEW.aggregate_id)\n"
+    "            OR EXISTS (SELECT 1 FROM operator_commands AS command\n"
+    "              WHERE command.command_id = NEW.aggregate_id\n"
+    "                AND json_extract(command.canonical_json, '$.action') =\n"
+    "                  'RESOLVE_SUBMITTED_UNKNOWN'\n"
+    "                AND (\n"
+    "                  json_type(command.canonical_json, '$.client_order_id') IS NOT 'text'\n"
+    "                  OR json_type(NEW.payload_json, '$.related_order_id') IS NOT 'text'\n"
+    "                  OR json_extract(command.canonical_json, '$.client_order_id') IS NOT\n"
+    "                    json_extract(NEW.payload_json, '$.related_order_id')\n"
+    "                  OR (NEW.event_type = 'OPERATOR_COMMAND_SUCCEEDED'\n"
+    "                    AND NOT EXISTS (SELECT 1 FROM ledger_events AS resolution\n"
+    "                      WHERE resolution.aggregate_id =\n"
+    "                        json_extract(command.canonical_json, '$.client_order_id')\n"
+    "                        AND resolution.event_type = 'SUBMITTED_UNKNOWN_RESOLVED'\n"
+    "                        AND json_extract(resolution.payload_json,\n"
+    "                          '$.operator_command_id') = NEW.aggregate_id\n"
+    "                        AND resolution.sequence < NEW.sequence))))",
+)
+V7_STATEMENTS = (
+    """CREATE UNIQUE INDEX order_request_permit_once
+        ON order_requests(json_extract(canonical_json, '$.permit.permit_id'))
+        WHERE json_type(canonical_json, '$.permit.permit_id') = 'text'""",
+    """CREATE TRIGGER submission_state_contract BEFORE INSERT ON ledger_events
+        WHEN NEW.event_type IN ('PREPARED','SUBMISSION_STARTED','ACKNOWLEDGED',
+          'SUBMISSION_REJECTED','SUBMITTED_UNKNOWN')
+        BEGIN
+          SELECT CASE
+            WHEN NEW.event_type = 'PREPARED' AND (
+              NOT EXISTS (SELECT 1 FROM order_requests
+                WHERE client_order_id = NEW.aggregate_id)
+              OR (SELECT event_type FROM ledger_events
+                WHERE aggregate_id = NEW.aggregate_id AND event_type IN
+                  ('PREPARED','SUBMISSION_STARTED','ACKNOWLEDGED',
+                   'SUBMISSION_REJECTED','SUBMITTED_UNKNOWN')
+                ORDER BY sequence DESC LIMIT 1) IS NOT NULL)
+            THEN RAISE(ABORT, 'invalid PREPARED transition')
+            WHEN NEW.event_type = 'SUBMISSION_STARTED' AND
+              (SELECT event_type FROM ledger_events
+                WHERE aggregate_id = NEW.aggregate_id AND event_type IN
+                  ('PREPARED','SUBMISSION_STARTED','ACKNOWLEDGED',
+                   'SUBMISSION_REJECTED','SUBMITTED_UNKNOWN')
+                ORDER BY sequence DESC LIMIT 1) IS NOT 'PREPARED'
+            THEN RAISE(ABORT, 'invalid SUBMISSION_STARTED transition')
+            WHEN NEW.event_type IN
+              ('ACKNOWLEDGED','SUBMISSION_REJECTED','SUBMITTED_UNKNOWN') AND
+              (SELECT event_type FROM ledger_events
+                WHERE aggregate_id = NEW.aggregate_id AND event_type IN
+                  ('PREPARED','SUBMISSION_STARTED','ACKNOWLEDGED',
+                   'SUBMISSION_REJECTED','SUBMITTED_UNKNOWN')
+                ORDER BY sequence DESC LIMIT 1) IS NOT 'SUBMISSION_STARTED'
+            THEN RAISE(ABORT, 'invalid submission terminal transition')
+          END;
+        END""",
+    "DROP TRIGGER operator_terminal_contract",
+    V7_TERMINAL_SQL,
+    "DROP TRIGGER unknown_resolution_contract",
+    V7_RESOLUTION_SQL,
+)
 
 
 class SQLiteLedger:
@@ -359,6 +437,13 @@ class SQLiteLedger:
         self.path = None if str(path) == ":memory:" else Path(path)
         self.connection = sqlite3.connect(path, isolation_level=None)
         try:
+            if self.path is not None:
+                try:
+                    link_count = self.path.stat().st_nlink
+                except OSError as error:
+                    raise SchemaError("SQLite database identity could not be verified") from error
+                if link_count != 1:
+                    raise SchemaError("hard-linked SQLite databases are unsupported")
             self.connection.execute("PRAGMA foreign_keys = ON")
             self._initialize()
             journal_mode = str(
@@ -381,6 +466,12 @@ class SQLiteLedger:
     def schema_version(self) -> int:
         return int(self.connection.execute("PRAGMA user_version").fetchone()[0])
 
+    @property
+    def runtime_identity(self) -> str:
+        if self.path is None:
+            return ":memory:"
+        return os.path.normcase(str(self.path.resolve()))
+
     @staticmethod
     def _objects(connection: sqlite3.Connection) -> set[str]:
         return {
@@ -397,7 +488,8 @@ class SQLiteLedger:
             2: V2_OBJECTS,
             3: V3_OBJECTS,
             4: V3_OBJECTS,
-            5: CURRENT_OBJECTS,
+            5: V6_OBJECTS,
+            6: V6_OBJECTS,
             SCHEMA_VERSION: CURRENT_OBJECTS,
         }[version]
         if cls._objects(connection) != expected_objects:
@@ -453,11 +545,23 @@ class SQLiteLedger:
                 {
                     "operator_terminal_contract": V5_STATEMENTS[4],
                     "unknown_resolution_contract": (
-                        V6_STATEMENTS[1] if version >= 6 else V4_STATEMENTS[3]
+                        V7_STATEMENTS[5]
+                        if version >= 7
+                        else V6_STATEMENTS[1]
+                        if version >= 6
+                        else V4_STATEMENTS[3]
                     ),
                     "schema_metadata": V5_STATEMENTS[1],
                     "schema_metadata_no_update": V5_STATEMENTS[2],
                     "schema_metadata_no_delete": V5_STATEMENTS[3],
+                }
+            )
+        if version >= 7:
+            expected_sql.update(
+                {
+                    "order_request_permit_once": V7_STATEMENTS[0],
+                    "submission_state_contract": V7_STATEMENTS[1],
+                    "operator_terminal_contract": V7_STATEMENTS[3],
                 }
             )
         actual_sql = {
@@ -494,9 +598,14 @@ class SQLiteLedger:
                 metadata = connection.execute(
                     "SELECT key, value FROM schema_metadata"
                 ).fetchall()
-                if len(metadata) != 1 or metadata[0][0] != "terminal_payload_v5_cutoff":
+                expected_metadata = {"terminal_payload_v5_cutoff"}
+                if version >= 7:
+                    expected_metadata.add("operator_binding_v7_cutoff")
+                metadata_map = dict(metadata)
+                if len(metadata) != len(expected_metadata) or set(metadata_map) != expected_metadata:
                     raise SchemaError("schema metadata contract is malformed")
-                terminal_v5_cutoff = int(metadata[0][1])
+                terminal_v5_cutoff = int(metadata_map["terminal_payload_v5_cutoff"])
+                operator_v7_cutoff = int(metadata_map.get("operator_binding_v7_cutoff", "0"))
                 if terminal_v5_cutoff < 0:
                     raise SchemaError("terminal payload cutoff cannot be negative")
                 highest_sequence = int(connection.execute(
@@ -504,21 +613,34 @@ class SQLiteLedger:
                 ).fetchone()[0])
                 if terminal_v5_cutoff > highest_sequence:
                     raise SchemaError("terminal payload cutoff exceeds ledger history")
+                if operator_v7_cutoff < 0 or operator_v7_cutoff > highest_sequence:
+                    raise SchemaError("operator binding cutoff is outside ledger history")
             else:
                 terminal_v5_cutoff = int(connection.execute(
                     "SELECT COALESCE(MAX(sequence), 0) FROM ledger_events"
                 ).fetchone()[0])
+                operator_v7_cutoff = 0
             command_rows = connection.execute(
                 "SELECT command_id, canonical_json FROM operator_commands"
             ).fetchall()
             commands: dict[str, tuple[OperatorCommand, dict[str, object]]] = {}
             for command_id, canonical_json in command_rows:
                 canonical = SQLiteLedger._strict_json(canonical_json)
-                if set(canonical) != {
+                legacy_command_keys = {
                     "command_id", "actor", "reason", "deployment_version",
                     "expected_safety_epoch", "requested_at", "expires_at", "action",
                     "account_id",
-                } or canonical["command_id"] != command_id:
+                }
+                current_command_keys = legacy_command_keys | {
+                    "client_order_id", "risk_decision_id", "execution_plan_id",
+                }
+                legacy_command = frozenset(canonical) == frozenset(legacy_command_keys)
+                if (
+                    frozenset(canonical) not in {
+                        frozenset(legacy_command_keys), frozenset(current_command_keys),
+                    }
+                    or canonical["command_id"] != command_id
+                ):
                     raise SchemaError("operator command canonical payload is malformed")
                 parsed = OperatorCommand(
                     command_id=canonical["command_id"],
@@ -529,7 +651,15 @@ class SQLiteLedger:
                     requested_at=datetime.fromisoformat(canonical["requested_at"]),
                     expires_at=datetime.fromisoformat(canonical["expires_at"]),
                     action=OperatorAction(canonical["action"]),
-                    account_id=canonical["account_id"],
+                    account_id=canonical["account_id"] or "LEGACY_GLOBAL",
+                    client_order_id=(
+                        "LEGACY_UNBOUND"
+                        if legacy_command
+                        and canonical["action"] == "RESOLVE_SUBMITTED_UNKNOWN"
+                        else canonical.get("client_order_id")
+                    ),
+                    risk_decision_id=canonical.get("risk_decision_id"),
+                    execution_plan_id=canonical.get("execution_plan_id"),
                 )
                 commands[command_id] = (parsed, canonical)
 
@@ -561,6 +691,14 @@ class SQLiteLedger:
 
             if any(len(requested.get(command_id, ())) != 1 for command_id in commands):
                 raise SchemaError("operator command must have exactly one REQUESTED event")
+            if version >= 7:
+                for command_id, (_, canonical) in commands.items():
+                    is_legacy = "client_order_id" not in canonical
+                    requested_sequence = requested[command_id][0]
+                    if is_legacy != (requested_sequence <= operator_v7_cutoff):
+                        raise SchemaError("operator command binding payload crosses v7 cutoff")
+                    if not is_legacy and canonical["account_id"] is None:
+                        raise SchemaError("current operator command requires an account alias")
 
             order_rows = {
                 row[0]: SQLiteLedger._strict_json(row[1])
@@ -568,9 +706,35 @@ class SQLiteLedger:
                     "SELECT client_order_id, canonical_json FROM order_requests"
                 )
             }
+            duplicate_permit = connection.execute(
+                """SELECT json_extract(canonical_json, '$.permit.permit_id')
+                   FROM order_requests
+                   WHERE json_type(canonical_json, '$.permit.permit_id') = 'text'
+                   GROUP BY json_extract(canonical_json, '$.permit.permit_id')
+                   HAVING COUNT(*) > 1 LIMIT 1"""
+            ).fetchone()
+            if duplicate_permit is not None:
+                raise SchemaError("permit is consumed by multiple order requests")
+            submission_states: dict[str, str] = {}
             last_unknown: dict[str, int] = {}
             last_resolution: dict[str, int] = {}
+            resolutions_by_command: dict[str, str] = {}
             for sequence, event_id, event_type, aggregate_id, occurred_at, payload_json in rows:
+                previous_submission_state = submission_states.get(aggregate_id)
+                if event_type == "PREPARED":
+                    if aggregate_id not in order_rows or previous_submission_state is not None:
+                        raise SchemaError("invalid historical PREPARED transition")
+                    submission_states[aggregate_id] = event_type
+                elif event_type == "SUBMISSION_STARTED":
+                    if previous_submission_state != "PREPARED":
+                        raise SchemaError("invalid historical SUBMISSION_STARTED transition")
+                    submission_states[aggregate_id] = event_type
+                elif event_type in {
+                    "ACKNOWLEDGED", "SUBMISSION_REJECTED", "SUBMITTED_UNKNOWN",
+                }:
+                    if previous_submission_state != "SUBMISSION_STARTED":
+                        raise SchemaError("invalid historical submission terminal transition")
+                    submission_states[aggregate_id] = event_type
                 if event_type == "SUBMITTED_UNKNOWN":
                     last_unknown[aggregate_id] = sequence
                     continue
@@ -639,6 +803,21 @@ class SQLiteLedger:
                     )
                     if common_invalid:
                         raise SchemaError("operator terminal payload is malformed")
+                    command = commands[aggregate_id][0]
+                    if (
+                        version >= 7
+                        and sequence > operator_v7_cutoff
+                        and command.action is OperatorAction.RESOLVE_SUBMITTED_UNKNOWN
+                        and (
+                            payload["related_order_id"] != command.client_order_id
+                            or (
+                                outcome is OperatorCommandOutcome.SUCCEEDED
+                                and resolutions_by_command.get(aggregate_id)
+                                != command.client_order_id
+                            )
+                        )
+                    ):
+                        raise SchemaError("unknown-resolution terminal contract is invalid")
                     continue
                 if event_type != "SUBMITTED_UNKNOWN_RESOLVED":
                     continue
@@ -671,6 +850,10 @@ class SQLiteLedger:
                     command_entry is None
                     or command_entry[0].action is not OperatorAction.RESOLVE_SUBMITTED_UNKNOWN
                     or command_entry[0].account_id != order_account
+                    or (
+                        "client_order_id" in command_entry[1]
+                        and command_entry[0].client_order_id != aggregate_id
+                    )
                     or not any(prior < sequence for prior in requested.get(command_id, ()))
                     or any(prior < sequence for prior in terminals.get(command_id, ()))
                     or last_unknown.get(aggregate_id, 0)
@@ -678,6 +861,7 @@ class SQLiteLedger:
                 ):
                     raise SchemaError("unknown resolution audit chain is invalid")
                 last_resolution[aggregate_id] = sequence
+                resolutions_by_command[command_id] = aggregate_id
         except SchemaError:
             raise
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
@@ -688,7 +872,7 @@ class SQLiteLedger:
             self.connection.execute("BEGIN IMMEDIATE")
             version = self.schema_version
             objects = self._objects(self.connection)
-            if version > SCHEMA_VERSION or version not in {0, 1, 2, 3, 4, 5, SCHEMA_VERSION}:
+            if version > SCHEMA_VERSION or version not in {0, 1, 2, 3, 4, 5, 6, 7}:
                 raise SchemaError(f"unsupported schema version {version}")
             if version == SCHEMA_VERSION:
                 self._validate_schema(self.connection, SCHEMA_VERSION)
@@ -697,28 +881,35 @@ class SQLiteLedger:
                 )
                 self.connection.execute("COMMIT")
                 return
-            if version == 5:
+            if version == 6:
+                self._validate_schema(self.connection, 6)
+                self._validate_audit_semantics(self.connection, version=6)
+                statements = V7_STATEMENTS
+            elif version == 5:
                 self._validate_schema(self.connection, 5)
                 self._validate_audit_semantics(self.connection, version=5)
-                statements = V6_STATEMENTS
+                statements = V6_STATEMENTS + V7_STATEMENTS
             elif version == 4:
                 self._validate_schema(self.connection, 4)
                 self._validate_audit_semantics(self.connection, version=4)
-                statements = V5_STATEMENTS + V6_STATEMENTS
+                statements = V5_STATEMENTS + V6_STATEMENTS + V7_STATEMENTS
             elif version == 3:
                 self._validate_schema(self.connection, 3)
                 self._validate_audit_semantics(self.connection, version=3)
-                statements = V4_STATEMENTS + V5_STATEMENTS + V6_STATEMENTS
+                statements = V4_STATEMENTS + V5_STATEMENTS + V6_STATEMENTS + V7_STATEMENTS
             elif version == 2:
                 self._validate_schema(self.connection, 2)
                 self._validate_audit_semantics(self.connection, version=2)
-                statements = V3_STATEMENTS + V4_STATEMENTS + V5_STATEMENTS + V6_STATEMENTS
+                statements = (
+                    V3_STATEMENTS + V4_STATEMENTS + V5_STATEMENTS + V6_STATEMENTS
+                    + V7_STATEMENTS
+                )
             elif version == 1:
                 self._validate_schema(self.connection, 1)
                 self._validate_audit_semantics(self.connection, version=1)
                 statements = (
                     V2_STATEMENTS + V3_STATEMENTS + V4_STATEMENTS + V5_STATEMENTS
-                    + V6_STATEMENTS
+                    + V6_STATEMENTS + V7_STATEMENTS
                 )
             elif objects:
                 self._validate_schema(self.connection, 0)
@@ -728,7 +919,7 @@ class SQLiteLedger:
                     + V3_STATEMENTS
                     + V4_STATEMENTS
                     + V5_STATEMENTS
-                    + V6_STATEMENTS
+                    + V6_STATEMENTS + V7_STATEMENTS
                 )
             else:
                 statements = (
@@ -738,7 +929,7 @@ class SQLiteLedger:
                     + V3_STATEMENTS
                     + V4_STATEMENTS
                     + V5_STATEMENTS
-                    + V6_STATEMENTS
+                    + V6_STATEMENTS + V7_STATEMENTS
                 )
             for statement in statements:
                 self.connection.execute(statement)
@@ -748,6 +939,14 @@ class SQLiteLedger:
                 ).fetchone()[0])
                 self.connection.execute(
                     "INSERT INTO schema_metadata VALUES ('terminal_payload_v5_cutoff', ?)",
+                    (str(cutoff),),
+                )
+            if version < 7:
+                cutoff = int(self.connection.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) FROM ledger_events"
+                ).fetchone()[0])
+                self.connection.execute(
+                    "INSERT INTO schema_metadata VALUES ('operator_binding_v7_cutoff', ?)",
                     (str(cutoff),),
                 )
             self._validate_schema(self.connection, SCHEMA_VERSION)
@@ -776,15 +975,37 @@ class SQLiteLedger:
             ),
         )
 
-    def reserve_order(
-        self, client_order_id: str, canonical_payload: dict[str, object],
+    def reserve_submission(
+        self,
+        client_order_id: str,
+        canonical_payload: Mapping[str, object],
         prepared_event: LedgerEvent,
+        started_event: LedgerEvent,
+        permit_id: str | None,
     ) -> bool:
         require_id(client_order_id, "client_order_id")
-        require_id(prepared_event.event_id, "event_id")
-        if prepared_event.aggregate_id != client_order_id or prepared_event.event_type != "PREPARED":
-            raise ValueError("reservation requires matching PREPARED event")
+        require_id(prepared_event.event_id, "prepared_event.event_id")
+        require_id(started_event.event_id, "started_event.event_id")
+        if (
+            prepared_event.aggregate_id != client_order_id
+            or prepared_event.event_type != "PREPARED"
+            or started_event.aggregate_id != client_order_id
+            or started_event.event_type != "SUBMISSION_STARTED"
+        ):
+            raise ValueError("reservation requires matching PREPARED and SUBMISSION_STARTED events")
         require_utc(prepared_event.occurred_at, "occurred_at")
+        require_utc(started_event.occurred_at, "occurred_at")
+        permit = canonical_payload.get("permit")
+        if permit is None:
+            canonical_permit_id = None
+        elif isinstance(permit, Mapping):
+            canonical_permit_id = permit.get("permit_id")
+        else:
+            raise ValueError("canonical permit must be an object or null")
+        if permit_id is not None:
+            require_id(permit_id, "permit_id")
+        if canonical_permit_id != permit_id:
+            raise ValueError("permit_id does not match the immutable order payload")
         canonical = self._json(canonical_payload, canonical=True)
         recorded_at = datetime.now(timezone.utc).isoformat()
         try:
@@ -798,11 +1019,23 @@ class SQLiteLedger:
                     raise OrderReservationConflict("client_order_id has different immutable payload")
                 self.connection.execute("COMMIT")
                 return False
-            self.connection.execute(
-                "INSERT INTO order_requests VALUES (?, ?, ?)",
-                (client_order_id, canonical, recorded_at),
-            )
+            try:
+                self.connection.execute(
+                    "INSERT INTO order_requests VALUES (?, ?, ?)",
+                    (client_order_id, canonical, recorded_at),
+                )
+            except sqlite3.IntegrityError as error:
+                consumed = permit_id is not None and self.connection.execute(
+                    """SELECT 1 FROM order_requests
+                       WHERE json_type(canonical_json, '$.permit.permit_id') = 'text'
+                         AND json_extract(canonical_json, '$.permit.permit_id') = ?""",
+                    (permit_id,),
+                ).fetchone()
+                if consumed:
+                    raise PermitAlreadyConsumed("permit has already been consumed") from error
+                raise
             self._insert_event(prepared_event, recorded_at)
+            self._insert_event(started_event, recorded_at)
             self.connection.execute("COMMIT")
             return True
         except BaseException:
@@ -838,6 +1071,9 @@ class SQLiteLedger:
             "requested_at": command.requested_at.isoformat(),
             "expires_at": command.expires_at.isoformat(), "action": command.action.value,
             "account_id": command.account_id,
+            "client_order_id": command.client_order_id,
+            "risk_decision_id": command.risk_decision_id,
+            "execution_plan_id": command.execution_plan_id,
         }
 
     def reserve_operator_command(self, command: OperatorCommand, event: LedgerEvent) -> None:
@@ -916,7 +1152,8 @@ class SQLiteLedger:
             ).fetchone()
             if command_row is None:
                 raise ValueError("operator command was not reserved")
-            action = OperatorAction(json.loads(command_row[0])["action"])
+            command_payload = json.loads(command_row[0])
+            action = OperatorAction(command_payload["action"])
             permit_action = action in {
                 OperatorAction.ISSUE_CANCEL,
                 OperatorAction.ISSUE_REDUCE_ONLY,
@@ -925,7 +1162,10 @@ class SQLiteLedger:
             permit_id, order_id = payload["related_permit_id"], payload["related_order_id"]
             if (
                 action is OperatorAction.RESOLVE_SUBMITTED_UNKNOWN
-                and (order_id is None or permit_id is not None)
+                and (
+                    order_id != command_payload.get("client_order_id")
+                    or permit_id is not None
+                )
             ) or (
                 permit_action
                 and outcome is OperatorCommandOutcome.SUCCEEDED
@@ -936,6 +1176,18 @@ class SQLiteLedger:
                 and (permit_id is not None or order_id is not None)
             ):
                 raise ValueError("operator terminal correlation is invalid")
+            if (
+                action is OperatorAction.RESOLVE_SUBMITTED_UNKNOWN
+                and outcome is OperatorCommandOutcome.SUCCEEDED
+                and not self.connection.execute(
+                    """SELECT 1 FROM ledger_events
+                       WHERE aggregate_id = ?
+                         AND event_type = 'SUBMITTED_UNKNOWN_RESOLVED'
+                         AND json_extract(payload_json, '$.operator_command_id') = ?""",
+                    (order_id, command_id),
+                ).fetchone()
+            ):
+                raise ValueError("successful unknown resolution requires persisted evidence")
             if not self.connection.execute(
                 """SELECT 1 FROM ledger_events
                    WHERE aggregate_id = ? AND event_type = 'OPERATOR_COMMAND_REQUESTED'""",
@@ -953,14 +1205,27 @@ class SQLiteLedger:
                 self.connection.execute("ROLLBACK")
             raise
 
-    def pending_operator_commands(self) -> tuple[str, ...]:
+    def pending_operator_commands(self, account_id: str | None = None) -> tuple[str, ...]:
+        if account_id is not None:
+            require_id(account_id, "account_id")
+        account_filter = ""
+        parameters: tuple[str, ...] = ()
+        if account_id is not None:
+            account_filter = (
+                " AND (json_type(command.canonical_json, '$.account_id') = 'null'"
+                " OR (json_type(command.canonical_json, '$.account_id') = 'text'"
+                " AND json_extract(command.canonical_json, '$.account_id') = ?))"
+            )
+            parameters = (account_id,)
         rows = self.connection.execute(
-            """SELECT command.command_id FROM operator_commands AS command
+            f"""SELECT command.command_id FROM operator_commands AS command
                WHERE NOT EXISTS (SELECT 1 FROM ledger_events AS terminal
                  WHERE terminal.aggregate_id = command.command_id
                    AND terminal.event_type IN
                        ('OPERATOR_COMMAND_SUCCEEDED','OPERATOR_COMMAND_FAILED'))
-               ORDER BY command.rowid"""
+               {account_filter}
+               ORDER BY command.rowid""",
+            parameters,
         ).fetchall()
         return tuple(row[0] for row in rows)
 
@@ -1000,6 +1265,7 @@ class SQLiteLedger:
             or event.event_type != "SUBMITTED_UNKNOWN_RESOLVED"
             or dict(event.payload) != expected_payload
             or command.action is not OperatorAction.RESOLVE_SUBMITTED_UNKNOWN
+            or command.client_order_id != client_order_id
             or command.account_id is None
         ):
             raise ValueError("invalid unknown-resolution event")
@@ -1056,28 +1322,65 @@ class SQLiteLedger:
                 self.connection.execute("ROLLBACK")
             raise
 
-    def incomplete_submissions(self) -> tuple[str, ...]:
+    def incomplete_submissions(self, account_id: str | None = None) -> tuple[str, ...]:
+        if account_id is not None:
+            require_id(account_id, "account_id")
+        account_join = ""
+        account_filter = ""
+        parameters: tuple[str, ...] = ()
+        if account_id is not None:
+            account_join = (
+                " JOIN order_requests AS reserved"
+                " ON reserved.client_order_id = event.aggregate_id"
+            )
+            account_filter = (
+                " AND json_type(reserved.canonical_json, '$.request.account_id') = 'text'"
+                " AND json_extract(reserved.canonical_json, '$.request.account_id') = ?"
+            )
+            parameters = (account_id,)
         rows = self.connection.execute(
-            """SELECT event.aggregate_id FROM ledger_events AS event
+            f"""SELECT event.aggregate_id FROM ledger_events AS event{account_join}
                WHERE event.event_type = 'SUBMISSION_STARTED' AND event.sequence = (
                  SELECT MAX(latest.sequence) FROM ledger_events AS latest
                  WHERE latest.aggregate_id = event.aggregate_id AND latest.event_type IN
                    ('PREPARED','SUBMISSION_STARTED','ACKNOWLEDGED',
                     'SUBMISSION_REJECTED','SUBMITTED_UNKNOWN'))
-               ORDER BY event.sequence"""
+               {account_filter}
+               ORDER BY event.sequence""",
+            parameters,
         ).fetchall()
         return tuple(row[0] for row in rows)
 
-    def unresolved_unknown_submissions(self) -> tuple[str, ...]:
+    def unresolved_unknown_submissions(
+        self, account_id: str | None = None,
+    ) -> tuple[str, ...]:
+        if account_id is not None:
+            require_id(account_id, "account_id")
+        account_join = ""
+        account_filter = ""
+        parameters: tuple[str, ...] = ()
+        if account_id is not None:
+            account_join = (
+                " JOIN order_requests AS reserved"
+                " ON reserved.client_order_id = unknown_event.aggregate_id"
+            )
+            account_filter = (
+                " AND json_type(reserved.canonical_json, '$.request.account_id') = 'text'"
+                " AND json_extract(reserved.canonical_json, '$.request.account_id') = ?"
+            )
+            parameters = (account_id,)
         rows = self.connection.execute(
-            """SELECT unknown_event.aggregate_id FROM ledger_events AS unknown_event
+            f"""SELECT unknown_event.aggregate_id
+               FROM ledger_events AS unknown_event{account_join}
                WHERE unknown_event.event_type = 'SUBMITTED_UNKNOWN'
+               {account_filter}
                GROUP BY unknown_event.aggregate_id
                HAVING MAX(unknown_event.sequence) > COALESCE((
                  SELECT MAX(resolved.sequence) FROM ledger_events AS resolved
                  WHERE resolved.aggregate_id = unknown_event.aggregate_id
                    AND resolved.event_type = 'SUBMITTED_UNKNOWN_RESOLVED'), 0)
-               ORDER BY MAX(unknown_event.sequence)"""
+               ORDER BY MAX(unknown_event.sequence)""",
+            parameters,
         ).fetchall()
         return tuple(row[0] for row in rows)
 
@@ -1090,16 +1393,18 @@ class SQLiteLedger:
         return self.connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
 
     @classmethod
-    def _verify_current(cls, connection: sqlite3.Connection, sequence: int) -> None:
+    def _verify_version(
+        cls, connection: sqlite3.Connection, sequence: int, version: int,
+    ) -> None:
         if connection.execute("PRAGMA integrity_check").fetchone() != ("ok",):
             raise BackupError("database integrity check failed")
         if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise BackupError("database foreign-key check failed")
-        if int(connection.execute("PRAGMA user_version").fetchone()[0]) != SCHEMA_VERSION:
+        if int(connection.execute("PRAGMA user_version").fetchone()[0]) != version:
             raise BackupError("backup schema version does not match")
         try:
-            cls._validate_schema(connection, SCHEMA_VERSION)
-            cls._validate_audit_semantics(connection, version=SCHEMA_VERSION)
+            cls._validate_schema(connection, version)
+            cls._validate_audit_semantics(connection, version=version)
         except SchemaError as error:
             raise BackupError("backup schema validation failed") from error
         actual = int(connection.execute(
@@ -1107,6 +1412,10 @@ class SQLiteLedger:
         ).fetchone()[0])
         if actual != sequence:
             raise BackupError("backup ledger sequence does not match")
+
+    @classmethod
+    def _verify_current(cls, connection: sqlite3.Connection, sequence: int) -> None:
+        cls._verify_version(connection, sequence, SCHEMA_VERSION)
 
     @staticmethod
     def _manifest_path(path: Path) -> Path:
@@ -1189,8 +1498,9 @@ class SQLiteLedger:
             backup_bytes = backup_path.read_bytes()
             if hashlib.sha256(backup_bytes).hexdigest() != manifest["sha256"]:
                 raise BackupError("backup hash does not match manifest")
-            if manifest["schema_version"] != SCHEMA_VERSION:
-                raise BackupError("manifest schema version does not match")
+            declared_version = manifest["schema_version"]
+            if type(declared_version) is not int or declared_version not in {6, SCHEMA_VERSION}:
+                raise BackupError("manifest schema version is unsupported")
             require_utc(datetime.fromisoformat(manifest["created_at"]), "created_at")
             require_id(manifest["app_version"], "app_version")
             sequence = int(manifest["highest_ledger_sequence"])
@@ -1214,16 +1524,38 @@ class SQLiteLedger:
             )
             restored = sqlite3.connect(temp_db)
             try:
-                cls._verify_current(source, sequence)
-                verified_digest = cls._content_digest(source)
+                cls._verify_version(source, sequence, declared_version)
+                source_digest = cls._content_digest(source)
                 source.backup(restored)
                 restored.commit()
-                cls._verify_current(restored, sequence)
-                if cls._content_digest(restored) != verified_digest:
+                cls._verify_version(restored, sequence, declared_version)
+                if cls._content_digest(restored) != source_digest:
                     raise BackupError("restored logical content does not match verified backup")
             finally:
                 restored.close()
                 source.close()
+            try:
+                staged_ledger = cls(temp_db)
+            except BaseException as error:
+                raise BackupError("staged backup migration failed") from error
+            try:
+                cls._verify_current(staged_ledger.connection, sequence)
+                staged_ledger.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                verified_digest = cls._content_digest(staged_ledger.connection)
+            finally:
+                staged_ledger.close()
+            temp_sidecars = (Path(f"{temp_db}-wal"), Path(f"{temp_db}-shm"))
+            if any(path.exists() for path in temp_sidecars):
+                raise BackupError("staged restore retained SQLite sidecars")
+            staged = sqlite3.connect(
+                f"{temp_db.resolve().as_uri()}?immutable=1", uri=True
+            )
+            try:
+                cls._verify_current(staged, sequence)
+                if cls._content_digest(staged) != verified_digest:
+                    raise BackupError("staged migrated content changed before publication")
+            finally:
+                staged.close()
             if destination.exists() or any(path.exists() for path in destination_sidecars):
                 raise FileExistsError("restore destination or SQLite sidecar appeared")
             cls._publish_exclusive(temp_db, destination)
@@ -1243,6 +1575,8 @@ class SQLiteLedger:
             return final_ledger
         finally:
             temp_db.unlink(missing_ok=True)
+            Path(f"{temp_db}-wal").unlink(missing_ok=True)
+            Path(f"{temp_db}-shm").unlink(missing_ok=True)
             verified_source.unlink(missing_ok=True)
 
     def close(self) -> None:

@@ -22,6 +22,10 @@ class OrderReservationConflict(RuntimeError):
     pass
 
 
+class PermitAlreadyConsumed(RuntimeError):
+    """The immutable LIVE permit is already bound to another order request."""
+
+
 class OperatorCommandConflict(RuntimeError):
     """The immutable command ID has already been reserved."""
 
@@ -31,11 +35,15 @@ class LedgerPersistenceError(RuntimeError):
 
 
 class Ledger(Protocol):
-    def reserve_order(
+    @property
+    def runtime_identity(self) -> str: ...
+    def reserve_submission(
         self,
         client_order_id: str,
         canonical_payload: Mapping[str, object],
         prepared_event: LedgerEvent,
+        started_event: LedgerEvent,
+        permit_id: str | None,
     ) -> bool: ...
     def append(self, event: LedgerEvent) -> None: ...
     def reserve_operator_command(
@@ -47,7 +55,7 @@ class Ledger(Protocol):
         outcome: OperatorCommandOutcome,
         terminal_event: LedgerEvent,
     ) -> None: ...
-    def pending_operator_commands(self) -> tuple[str, ...]: ...
+    def pending_operator_commands(self, account_id: str | None = None) -> tuple[str, ...]: ...
     def record_unknown_resolution(
         self,
         client_order_id: str,
@@ -56,6 +64,8 @@ class Ledger(Protocol):
         event: LedgerEvent,
     ) -> None: ...
     def events_for(self, aggregate_id: str) -> tuple[LedgerEvent, ...]: ...
-    def incomplete_submissions(self) -> tuple[str, ...]: ...
-    def unresolved_unknown_submissions(self) -> tuple[str, ...]: ...
+    def incomplete_submissions(self, account_id: str | None = None) -> tuple[str, ...]: ...
+    def unresolved_unknown_submissions(
+        self, account_id: str | None = None,
+    ) -> tuple[str, ...]: ...
     def integrity_check(self) -> bool: ...

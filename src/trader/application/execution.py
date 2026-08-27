@@ -1,6 +1,8 @@
 from collections.abc import Callable
+from contextlib import AbstractContextManager, ExitStack
 from datetime import datetime, timezone
 import re
+from typing import Protocol
 from uuid import uuid4
 
 from trader.application.safety import SafetyController
@@ -26,7 +28,12 @@ from trader.ports.broker import (
     BrokerSubmitOutcome,
     BrokerSubmitResult,
 )
-from trader.ports.ledger import Ledger, LedgerEvent, OrderReservationConflict
+from trader.ports.ledger import (
+    Ledger,
+    LedgerEvent,
+    OrderReservationConflict,
+    PermitAlreadyConsumed,
+)
 
 
 class AlreadySubmitted(RuntimeError):
@@ -41,6 +48,17 @@ class SubmissionValidationError(ValueError):
     pass
 
 
+class ProcessLock(Protocol):
+    @property
+    def acquired(self) -> bool: ...
+
+    def protects(self, account_alias: str) -> bool: ...
+
+    def protects_runtime(self, runtime_identity: str) -> bool: ...
+
+    def hold(self, account_alias: str) -> AbstractContextManager[None]: ...
+
+
 class ExecutionService:
     def __init__(
         self,
@@ -48,15 +66,27 @@ class ExecutionService:
         ledger: Ledger,
         safety: SafetyController,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        process_lock: ProcessLock | None = None,
+        *,
+        account_id: str,
     ) -> None:
         if type(broker.environment) is not BrokerEnvironment:
             raise ValueError("broker environment must be BrokerEnvironment")
         self.broker = broker
         self.ledger = ledger
+        self.process_lock = process_lock
+        self.account_id = account_id
+        if not isinstance(account_id, str) or not account_id.strip():
+            raise SubmissionValidationError("service requires an internal account alias")
+        self._require_live_lock(self.account_id)
         self.safety = safety
         self.clock = clock
         self._do_not_retry: set[str] = set()
-        self._recover_incomplete_submissions()
+        if self.broker.environment is BrokerEnvironment.LIVE:
+            with self._held_live_lock():
+                self._recover_incomplete_submissions(self.account_id)
+        else:
+            self._recover_incomplete_submissions(self.account_id)
 
     def submit(
         self,
@@ -65,6 +95,21 @@ class ExecutionService:
         plan: ExecutionPlan,
         intent: TradeIntent,
         permit: TradingPermit | None = None,
+    ) -> SubmissionState:
+        if request.account_id != self.account_id:
+            raise SubmissionValidationError("request account does not match the service account")
+        if self.broker.environment is not BrokerEnvironment.LIVE:
+            return self._submit(request, risk_decision, plan, intent, permit)
+        with self._held_live_lock():
+            return self._submit(request, risk_decision, plan, intent, permit)
+
+    def _submit(
+        self,
+        request: OrderRequest,
+        risk_decision: RiskDecision,
+        plan: ExecutionPlan,
+        intent: TradeIntent,
+        permit: TradingPermit | None,
     ) -> SubmissionState:
         if request.client_order_id in self._do_not_retry:
             raise AlreadySubmitted("submission is never retried automatically")
@@ -75,13 +120,6 @@ class ExecutionService:
             self.safety.halt("CLOCK_FAILURE")
             raise SubmissionValidationError("clock failure halted submission") from error
         self._validate_evidence(request, risk_decision, plan, intent, permit, now)
-        try:
-            existing = self.ledger.events_for(request.client_order_id)
-        except Exception as error:
-            self._persistence_failed(request.client_order_id, error)
-        if any(event.event_type != SubmissionState.PREPARED for event in existing):
-            raise AlreadySubmitted("submission is never retried automatically")
-
         prepared = LedgerEvent(
             str(uuid4()), SubmissionState.PREPARED, request.client_order_id, now,
             {
@@ -89,20 +127,27 @@ class ExecutionService:
                 "risk_decision_id": risk_decision.decision_id,
             },
         )
+        submission_started = LedgerEvent(
+            str(uuid4()), SubmissionState.SUBMISSION_STARTED,
+            request.client_order_id, now, {"permit_id": None if permit is None else permit.permit_id},
+        )
         try:
-            reserved = self.ledger.reserve_order(
+            reserved = self.ledger.reserve_submission(
                 request.client_order_id,
                 self._canonical_payload(request, risk_decision, plan, intent, permit),
                 prepared,
+                submission_started,
+                None if permit is None else permit.permit_id,
             )
         except OrderReservationConflict:
             raise
+        except PermitAlreadyConsumed as error:
+            raise AlreadySubmitted("permit was already consumed") from error
         except Exception as error:
             self._persistence_failed(request.client_order_id, error)
         if not reserved:
             raise AlreadySubmitted("client_order_id was already reserved")
 
-        self._record(request.client_order_id, SubmissionState.SUBMISSION_STARTED, now)
         self._do_not_retry.add(request.client_order_id)
         try:
             result = self.broker.submit(request)  # Deliberately outside a database transaction.
@@ -136,6 +181,40 @@ class ExecutionService:
             result.detail_code,
         )
         return state
+
+    def _require_live_lock(self, account_id: str | None = None) -> None:
+        if self.broker.environment is not BrokerEnvironment.LIVE:
+            return
+        if not isinstance(account_id, str) or not account_id.strip():
+            raise SubmissionValidationError("LIVE service requires an internal account alias")
+        lock = self.process_lock
+        try:
+            valid = (
+                lock is not None
+                and lock.acquired
+                and lock.protects(account_id)
+                and lock.protects_runtime(self.ledger.runtime_identity)
+            )
+        except Exception as error:
+            raise SubmissionValidationError("LIVE process lock validation failed") from error
+        if not valid:
+            raise SubmissionValidationError(
+                "LIVE broker requires an acquired lock for the request account"
+            )
+
+    def _held_live_lock(self) -> AbstractContextManager[None]:
+        self._require_live_lock(self.account_id)
+        lock = self.process_lock
+        account_id = self.account_id
+        if lock is None or account_id is None:
+            raise SubmissionValidationError("LIVE process lock is unavailable")
+        stack = ExitStack()
+        try:
+            stack.enter_context(lock.hold(account_id))
+        except Exception as error:
+            stack.close()
+            raise SubmissionValidationError("LIVE process lock validation failed") from error
+        return stack
 
     def _validate_evidence(
         self,
@@ -176,10 +255,20 @@ class ExecutionService:
             raise SubmissionValidationError("long-only SELL exceeds current long position")
         if now >= plan.expires_at:
             raise SubmissionValidationError("execution plan has expired")
+        if self.broker.environment is not BrokerEnvironment.LIVE and permit is not None:
+            raise SubmissionValidationError("non-LIVE broker does not accept a permit")
         if self.broker.environment is BrokerEnvironment.LIVE:
             if permit is None:
                 raise SubmissionValidationError("LIVE broker requires issued permit")
-            self.safety.validate(permit, request.account_id, PermitScope.NEW_ORDER, now)
+            self.safety.validate(
+                permit,
+                request.account_id,
+                PermitScope.NEW_ORDER,
+                now,
+                client_order_id=request.client_order_id,
+                risk_decision_id=risk.decision_id,
+                execution_plan_id=plan.plan_id,
+            )
             if (
                 permit.account_snapshot_id != risk.input_snapshot_id
                 or permit.policy_version != risk.policy_version
@@ -253,6 +342,11 @@ class ExecutionService:
             },
             "permit": None if permit is None else {
                 "permit_id": permit.permit_id,
+                "account_id": permit.account_id,
+                "scope": permit.scope.value,
+                "client_order_id": permit.client_order_id,
+                "risk_decision_id": permit.risk_decision_id,
+                "execution_plan_id": permit.execution_plan_id,
                 "safety_epoch": permit.safety_epoch,
                 "account_snapshot_id": permit.account_snapshot_id,
                 "market_snapshot_id": permit.market_snapshot_id,
@@ -263,9 +357,9 @@ class ExecutionService:
             },
         }
 
-    def _recover_incomplete_submissions(self) -> None:
+    def _recover_incomplete_submissions(self, account_id: str | None = None) -> None:
         try:
-            incomplete = self.ledger.incomplete_submissions()
+            incomplete = self.ledger.incomplete_submissions(account_id)
             for client_order_id in incomplete:
                 self._record(
                     client_order_id,
@@ -273,7 +367,7 @@ class ExecutionService:
                     self.clock(),
                     detail_code="RESTART_RECOVERY",
                 )
-            for client_order_id in self.ledger.unresolved_unknown_submissions():
+            for client_order_id in self.ledger.unresolved_unknown_submissions(account_id):
                 self._do_not_retry.add(client_order_id)
                 self.safety.block_unknown_submission(client_order_id)
         except PersistenceFailure:

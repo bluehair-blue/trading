@@ -13,6 +13,7 @@ from trader.domain.models import (
     PermitScope,
     TradingPermit,
     UnknownResolutionEvidence,
+    require_id,
     require_utc,
 )
 from trader.ports.ledger import (
@@ -42,15 +43,19 @@ class OperatorCommandService:
         safety: SafetyController,
         deployment_version: str,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        *,
+        account_id: str,
     ) -> None:
         if not deployment_version.strip():
             raise ValueError("deployment_version must be non-empty")
+        require_id(account_id, "account_id")
         self.ledger = ledger
         self.safety = safety
         self.deployment_version = deployment_version
         self.clock = clock
+        self.account_id = account_id
         try:
-            for command_id in ledger.pending_operator_commands():
+            for command_id in ledger.pending_operator_commands(account_id):
                 safety.halt(f"PENDING_OPERATOR_COMMAND:{command_id}")
         except Exception as error:
             safety.halt("PERSISTENCE_FAILURE")
@@ -66,6 +71,8 @@ class OperatorCommandService:
     ) -> T:
         if type(command) is not OperatorCommand:
             raise TypeError("operator action requires an OperatorCommand")
+        if command.account_id != self.account_id:
+            raise OperatorCommandRejected("operator command belongs to another account")
         requested = LedgerEvent(
             str(uuid4()),
             "OPERATOR_COMMAND_REQUESTED",
@@ -81,6 +88,9 @@ class OperatorCommandService:
                 "expires_at": command.expires_at.isoformat(),
                 "action": command.action.value,
                 "account_id": command.account_id,
+                "client_order_id": command.client_order_id,
+                "risk_decision_id": command.risk_decision_id,
+                "execution_plan_id": command.execution_plan_id,
                 "previous_state": self.safety.state.value,
             },
         )
@@ -144,6 +154,23 @@ class OperatorCommandService:
         }
         if command.action in account_actions and command.account_id is None:
             raise OperatorCommandRejected("operator command requires an internal account alias")
+        if command.action is OperatorAction.RESOLVE_SUBMITTED_UNKNOWN:
+            if (
+                command.client_order_id is None
+                or command.risk_decision_id is not None
+                or command.execution_plan_id is not None
+            ):
+                raise OperatorCommandRejected(
+                    "unknown resolution requires only a client_order_id claim"
+                )
+        elif any((
+                command.client_order_id,
+                command.risk_decision_id,
+                command.execution_plan_id,
+            )):
+            raise OperatorCommandRejected(
+                "current operator permit actions cannot carry order binding claims"
+            )
 
     def _terminal(
         self,
@@ -224,8 +251,14 @@ class OperatorCommandService:
         client_order_id: str,
         evidence: UnknownResolutionEvidence,
     ) -> None:
+        if type(command) is not OperatorCommand:
+            raise TypeError("operator action requires an OperatorCommand")
         if type(evidence) is not UnknownResolutionEvidence:
             raise TypeError("typed unknown-resolution evidence is required")
+        if command.client_order_id != client_order_id:
+            raise OperatorCommandRejected(
+                "operator command target does not match the unknown submission"
+            )
 
         def persist_evidence_then_clear(now: datetime) -> None:
             blocker = f"SUBMITTED_UNKNOWN:{client_order_id}"
