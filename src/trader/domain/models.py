@@ -771,6 +771,8 @@ class OperatorCommand:
             if value is not None:
                 require_id(value, name)
         if self.action is OperatorAction.RESOLVE_SUBMITTED_UNKNOWN:
+            if self.client_order_id is None:
+                raise ValueError("unknown resolution requires client_order_id")
             require_id(self.client_order_id, "client_order_id")
             if self.risk_decision_id is not None or self.execution_plan_id is not None:
                 raise ValueError(

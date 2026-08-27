@@ -31,6 +31,7 @@ def main() -> None:
     # cache or generated artifact behind.
     with tempfile.TemporaryDirectory(prefix="personal-trader-coverage-") as directory:
         coverage_file = str(Path(directory) / ".coverage")
+        mypy_cache = str(Path(directory) / "mypy-cache")
         environment["PYTHONPYCACHEPREFIX"] = str(Path(directory) / "pycache")
         commands = (
             [sys.executable, "-m", "compileall", "-q", "src", "tests", "scripts"],
@@ -59,6 +60,16 @@ def main() -> None:
                 f"--fail-under={COVERAGE_FLOOR}",
             ],
             [sys.executable, "-m", "ruff", "check", "src", "tests", "scripts"],
+            [
+                sys.executable,
+                "-m",
+                "mypy",
+                "--config-file",
+                "pyproject.toml",
+                "--cache-dir",
+                mypy_cache,
+                "src",
+            ],
             [sys.executable, "scripts/secret_scan.py", str(ROOT)],
             ["uv", "pip", "check", "--python", sys.executable],
         )

@@ -504,13 +504,12 @@ uv lock --check
 uv run python scripts/verify.py
 ```
 
-`verify.py`는 임시 디렉터리의 branch coverage 데이터와 bytecode cache를 사용하며,
-compileall, 전체 unittest, coverage floor 70%, Ruff, repository secret scan,
+`verify.py`는 임시 디렉터리의 branch coverage 데이터, bytecode와 mypy cache를 사용하며,
+compileall, 전체 unittest, coverage floor 70%, Ruff, 전체 `src` mypy, repository secret scan,
 `uv pip check --python <현재 인터프리터>`를 fail-fast로 실행한다. GitHub Actions는
 Ubuntu와 Windows에서 locked development environment를 다시 만들고 같은 명령을 실행한다.
-2026-08-27 현재 전체 273개 테스트와 branch coverage 85%가 통과했다.
-전체 `src` mypy에는 현재 실제 오류가 남아 있어 broad ignore나 exclude로 녹색을 가장하지
-않고 type-check gate를 보류했다.
+2026-08-27 현재 전체 273개 테스트와 branch coverage 84%가 통과했다.
+고정된 mypy 2.3.1도 broad ignore나 exclude 없이 전체 42개 source file에서 통과한다.
 
 이번 체크포인트는 공통 모드 safety/permit, 저장소가 강제하는 제출 상태, risk reservation,
 구조화 read-only 관측과 대사, 단일 WebSocket supervisor, 계층형 limiter, no-retry mutation

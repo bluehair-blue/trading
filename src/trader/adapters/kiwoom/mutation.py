@@ -5,8 +5,8 @@ from datetime import date, datetime
 from hashlib import sha256
 import json
 import re
-from collections.abc import Mapping
-from typing import Protocol
+from collections.abc import Callable, Mapping
+from typing import Protocol, TypeIs
 from urllib.parse import urlsplit
 
 from trader.domain.broker_observations import BrokerOrderRef
@@ -133,7 +133,7 @@ class KiwoomMutationClient:
         account_id: str,
         transport: HttpTransport,
         raw_store: RawEnvelopeStore,
-        clock,
+        clock: Callable[[], datetime],
         rejection_policy: MutationRejectionPolicy,
         route: MutationRoute,
     ) -> None:
@@ -411,7 +411,10 @@ def _validate_request(
         raise ValueError("request_sha256 does not match the exact request body")
 
 
-def _safe_completion(clock, started_at: datetime) -> tuple[datetime, bool]:
+def _safe_completion(
+    clock: Callable[[], datetime],
+    started_at: datetime,
+) -> tuple[datetime, bool]:
     try:
         completed_at = clock()
         require_utc(completed_at, "completed_at")
@@ -435,7 +438,7 @@ def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
-def _valid_order_id(value: object) -> bool:
+def _valid_order_id(value: object) -> TypeIs[str]:
     return (
         isinstance(value, str)
         and bool(value.strip())

@@ -161,7 +161,7 @@ class OrderCoordinator:
         except Exception as error:
             self.safety.halt("CLOCK_FAILURE")
             raise SubmissionValidationError("clock failure halted submission") from error
-        self._validate_evidence(
+        validated_permit = self._validate_evidence(
             request, risk_decision, plan, intent, permit, now, self._last_monotonic
         )
         reservation_terms = self._derive_reservation_terms(
@@ -176,15 +176,17 @@ class OrderCoordinator:
         )
         submission_started = LedgerEvent(
             str(uuid4()), SubmissionState.SUBMISSION_STARTED,
-            request.client_order_id, now, {"permit_id": None if permit is None else permit.permit_id},
+            request.client_order_id, now, {"permit_id": validated_permit.permit_id},
         )
         try:
             reserved = self.ledger.reserve_submission(
                 request.client_order_id,
-                self._canonical_payload(request, risk_decision, plan, intent, permit),
+                self._canonical_payload(
+                    request, risk_decision, plan, intent, validated_permit
+                ),
                 prepared,
                 submission_started,
-                permit.permit_id,
+                validated_permit.permit_id,
                 reservation_terms,
             )
         except OrderReservationConflict:
@@ -325,7 +327,7 @@ class OrderCoordinator:
                 "LIVE broker requires an acquired lock for the request account"
             )
 
-    def _held_live_lock(self) -> AbstractContextManager[None]:
+    def _held_live_lock(self) -> ExitStack[bool | None]:
         self._require_live_lock(self.account_id)
         lock = self.process_lock
         account_id = self.account_id
@@ -348,12 +350,16 @@ class OrderCoordinator:
         permit: TradingPermit | None,
         now: datetime,
         monotonic_now: float,
-    ) -> None:
+    ) -> TradingPermit:
+        original = risk.original_quantity
+        approved = risk.approved_quantity
+        if original is None or approved is None:
+            raise SubmissionValidationError("pre-trade risk requires share quantities")
         try:
             for name, value in (
                 ("request.quantity", request.quantity),
-                ("risk.original_quantity", risk.original_quantity),
-                ("risk.approved_quantity", risk.approved_quantity),
+                ("risk.original_quantity", original),
+                ("risk.approved_quantity", approved),
                 ("plan.quantity", plan.quantity),
                 ("intent.target_quantity", intent.target_quantity),
                 ("intent.current_quantity", intent.current_quantity),
@@ -367,8 +373,7 @@ class OrderCoordinator:
             raise SubmissionValidationError("submission requires PRE_TRADE risk")
         if risk.outcome not in {RiskOutcome.APPROVED, RiskOutcome.ADJUSTED}:
             raise SubmissionValidationError("submission requires approved risk")
-        approved = risk.approved_quantity
-        if approved is None or approved == 0:
+        if approved == 0:
             raise SubmissionValidationError("submission requires nonzero approved quantity")
         expected_side = Side.BUY if approved > 0 else Side.SELL
         if (
@@ -449,6 +454,7 @@ class OrderCoordinator:
             != evidence.market.maximum_limit_price
         ):
             raise SubmissionValidationError("execution plan market evidence is stale")
+        return permit
 
     def _canonical_payload(
         self,
@@ -456,8 +462,13 @@ class OrderCoordinator:
         risk: RiskDecision,
         plan: ExecutionPlan,
         intent: TradeIntent,
-        permit: TradingPermit | None,
+        permit: TradingPermit,
     ) -> dict[str, object]:
+        evidence = self.safety.evidence
+        original = risk.original_quantity
+        approved = risk.approved_quantity
+        if evidence is None or original is None or approved is None:
+            raise SubmissionValidationError("validated submission evidence is required")
         return {
             "environment": self.broker.environment.value,
             "request": {
@@ -482,11 +493,11 @@ class OrderCoordinator:
                 "policy_version": risk.policy_version,
                 "input_snapshot_id": risk.input_snapshot_id,
                 "input_snapshot_environment": (
-                    self.safety.evidence.account_snapshot.environment.value
+                    evidence.account_snapshot.environment.value
                 ),
                 "trade_intent_id": risk.trade_intent_id,
-                "original_quantity": canonical_share_quantity(risk.original_quantity),
-                "approved_quantity": canonical_share_quantity(risk.approved_quantity),
+                "original_quantity": canonical_share_quantity(original),
+                "approved_quantity": canonical_share_quantity(approved),
                 "outcome": risk.outcome.value,
                 "reason_codes": list(risk.reason_codes),
                 "evaluated_at": risk.evaluated_at.isoformat(),
@@ -544,7 +555,7 @@ class OrderCoordinator:
                 "created_monotonic": plan.created_monotonic,
                 "expires_monotonic": plan.expires_monotonic,
             },
-            "permit": None if permit is None else {
+            "permit": {
                 "permit_id": permit.permit_id,
                 "environment": permit.environment.value,
                 "account_id": permit.account_id,

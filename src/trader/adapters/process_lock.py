@@ -9,14 +9,29 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
 import threading
 from collections.abc import Iterator
 from typing import Self
 
-if os.name == "nt":
+if sys.platform == "win32":
     import msvcrt
+
+    def _platform_lock(fd: int) -> None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+
+    def _platform_unlock(fd: int) -> None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
 else:
     import fcntl
+
+    def _platform_lock(fd: int) -> None:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _platform_unlock(fd: int) -> None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
 
 
 class ProcessLockError(RuntimeError):
@@ -153,19 +168,11 @@ class AccountProcessLock:
 
     @staticmethod
     def _lock_fd(fd: int) -> None:
-        if os.name == "nt":
-            os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-        else:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _platform_lock(fd)
 
     @staticmethod
     def _unlock_fd(fd: int) -> None:
-        if os.name == "nt":
-            os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-        else:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+        _platform_unlock(fd)
 
     @staticmethod
     def _is_busy(error: OSError) -> bool:

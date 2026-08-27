@@ -241,11 +241,11 @@ def canonical_resolution_payload(
             "fetched_at": query.fetched_at.isoformat(),
         },
     }
-    if type(resolution) in (BrokerOrderLinked, ManualActivityLinked):
-        payload["broker_order_ref"] = _broker_ref_payload(resolution.broker_order_ref)
     if type(resolution) is BrokerOrderLinked:
+        payload["broker_order_ref"] = _broker_ref_payload(resolution.broker_order_ref)
         payload["source_api_id"] = resolution.source_api_id
     elif type(resolution) is ManualActivityLinked:
+        payload["broker_order_ref"] = _broker_ref_payload(resolution.broker_order_ref)
         payload["manual_activity"] = {
             "reference": resolution.manual_activity_reference,
             "actor": resolution.actor,
@@ -258,7 +258,10 @@ def resolution_from_payload(payload: object) -> TypedUnknownResolutionEvidence:
     """Strictly rebuild typed evidence; extra or missing keys are rejected."""
     if type(payload) is not dict:
         raise ValueError("resolution payload must be an exact object")
-    result = UnknownResolutionResult(payload.get("result"))
+    result_value = payload.get("result")
+    if type(result_value) is not str:
+        raise ValueError("resolution result must be text")
+    result = UnknownResolutionResult(result_value)
     expected = {
         UnknownResolutionResult.CONFIRMED_ABSENT: {
             "operator_command_id", "result", "query",

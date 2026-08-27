@@ -4,8 +4,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from itertools import groupby
+from collections.abc import Callable
+from typing import TypeVar
 
 from trader.domain.models import InstrumentId, PositionTarget, TargetUnit, require_decimal, require_id, require_utc
+
+
+_Item = TypeVar("_Item")
+_Key = TypeVar("_Key")
 
 
 @dataclass(frozen=True)
@@ -181,8 +187,12 @@ def allocate_targets(
     return AllocationResult(tuple(account_targets), tuple(virtual))
 
 
-def _unique_by_key(items: tuple, key, label: str) -> dict:
-    result = {}
+def _unique_by_key(
+    items: tuple[_Item, ...],
+    key: Callable[[_Item], _Key],
+    label: str,
+) -> dict[_Key, _Item]:
+    result: dict[_Key, _Item] = {}
     for item in items:
         item_key = key(item)
         if item_key in result:

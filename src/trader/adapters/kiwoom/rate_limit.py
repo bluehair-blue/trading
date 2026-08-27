@@ -257,7 +257,9 @@ class KiwoomReadonlyRateLimiter:
         in_peak: bool,
     ) -> list[tuple[tuple[str, ...], int, float, RateLimitReason]]:
         second = self._policy.window_seconds
-        buckets = [(("global",), self._policy.us_global_queries, second, RateLimitReason.GLOBAL)]
+        buckets: list[tuple[tuple[str, ...], int, float, RateLimitReason]] = [
+            (("global",), self._policy.us_global_queries, second, RateLimitReason.GLOBAL)
+        ]
         if kind in (RateLimitKind.QUERY, RateLimitKind.SPECIAL):
             limit = (
                 self._policy.us_peak_account_queries

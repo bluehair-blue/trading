@@ -234,6 +234,8 @@ class SafetyController:
                 ("risk_decision_id", risk_decision_id),
                 ("execution_plan_id", execution_plan_id),
             ):
+                if value is None:
+                    raise ValueError(f"{name} is required")
                 require_id(value, name)
         except ValueError as error:
             raise InvalidPermit("NEW_ORDER permit requires exact order binding") from error

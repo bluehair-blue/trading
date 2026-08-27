@@ -192,7 +192,9 @@ def canonical_broker_fact_payload(fact: BrokerLifecycleFact) -> dict[str, object
                 "currency": fact.currency,
             }
         )
-    elif type(fact) in (BrokerOrderCanceled, BrokerOrderExpired):
+    elif type(fact) is BrokerOrderCanceled:
+        payload["quantity"] = str(int(fact.quantity))
+    elif type(fact) is BrokerOrderExpired:
         payload["quantity"] = str(int(fact.quantity))
     else:
         assert type(fact) is BrokerOrderRejected

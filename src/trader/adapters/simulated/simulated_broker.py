@@ -374,6 +374,8 @@ class SimulatedBroker:
     ) -> BrokerCancelResult | SimulationResult:
         if type(command) is CancelOrderCommand:
             return self._cancel_command(command)
+        if not isinstance(command, str):
+            raise TypeError("simulation event cancellation requires an order id")
         if occurred_at is None or sequence is None:
             raise TypeError("simulation event cancellation requires occurred_at and sequence")
         return self._cancel_event(command, occurred_at=occurred_at, sequence=sequence)

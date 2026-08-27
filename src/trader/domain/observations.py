@@ -206,6 +206,8 @@ class AuthenticationObservation:
             self.error_codes,
         )
         if self.quality is ObservationQuality.COMPLETE:
+            if self.expires_dt is None:
+                raise ValueError("complete authentication requires expires_dt")
             _require_text(self.expires_dt, "expires_dt")
         elif self.expires_dt is not None:
             raise ValueError("incomplete authentication cannot carry expires_dt")

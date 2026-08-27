@@ -943,6 +943,7 @@ class SQLiteLedger:
         }[version]
         if cls._objects(connection) != expected_objects:
             raise SchemaError("database objects do not match the known schema")
+        tables: tuple[str, ...]
         if version == 0:
             tables = ("ledger_events", "order_requests")
         elif version < 5:
@@ -1048,7 +1049,7 @@ class SQLiteLedger:
         return normalized.replace("( ", "(").replace(" )", ")")
 
     @staticmethod
-    def _strict_json(value: str) -> object:
+    def _strict_json(value: str) -> dict[str, object]:
         def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
             result: dict[str, object] = {}
             for key, item in pairs:
@@ -1057,7 +1058,10 @@ class SQLiteLedger:
                 result[key] = item
             return result
 
-        return json.loads(value, object_pairs_hook=reject_duplicates)
+        parsed = json.loads(value, object_pairs_hook=reject_duplicates)
+        if not isinstance(parsed, dict):
+            raise ValueError("canonical JSON must be an object")
+        return parsed
 
     @staticmethod
     def _cancel_binding_is_valid(canonical: dict[str, object]) -> bool:
@@ -1069,6 +1073,8 @@ class SQLiteLedger:
             return False
         target = payload.get("target")
         instrument = payload.get("instrument")
+        if not isinstance(target, dict) or not isinstance(instrument, dict):
+            return False
         try:
             quantity = payload["remaining_quantity"]
             valid = (
@@ -1076,7 +1082,6 @@ class SQLiteLedger:
                     "command_id", "target", "instrument", "remaining_quantity",
                     "account_snapshot_id",
                 }
-                and isinstance(target, dict)
                 and set(target) == {
                     "environment", "account_id", "business_date", "broker_order_id",
                 }
@@ -1085,7 +1090,6 @@ class SQLiteLedger:
                 and isinstance(target["business_date"], str)
                 and datetime.fromisoformat(target["business_date"]).date().isoformat()
                 == target["business_date"]
-                and isinstance(instrument, dict)
                 and set(instrument) == {"market", "symbol", "currency"}
                 and isinstance(quantity, str)
                 and canonical_share_quantity(
@@ -1239,27 +1243,65 @@ class SQLiteLedger:
                     )
                 ):
                     raise SchemaError("operator command canonical payload is malformed")
+                command_id_value = canonical["command_id"]
+                actor = canonical["actor"]
+                reason = canonical["reason"]
+                deployment_version = canonical["deployment_version"]
+                expected_safety_epoch = canonical["expected_safety_epoch"]
+                requested_at = canonical["requested_at"]
+                expires_at = canonical["expires_at"]
+                action = canonical["action"]
+                account_id = canonical["account_id"]
+                environment = canonical.get(
+                    "environment", TradingEnvironment.SIMULATED.value
+                )
+                client_order_id = canonical.get("client_order_id")
+                risk_decision_id = canonical.get("risk_decision_id")
+                execution_plan_id = canonical.get("execution_plan_id")
+                if (
+                    not all(isinstance(value, str) for value in (
+                        command_id_value, actor, reason, deployment_version,
+                        requested_at, expires_at, action, environment,
+                    ))
+                    or type(expected_safety_epoch) is not int
+                    or (account_id is not None and not isinstance(account_id, str))
+                    or any(value is not None and not isinstance(value, str) for value in (
+                        client_order_id, risk_decision_id, execution_plan_id,
+                    ))
+                ):
+                    raise SchemaError("operator command canonical payload is malformed")
+                assert isinstance(command_id_value, str)
+                assert isinstance(actor, str)
+                assert isinstance(reason, str)
+                assert isinstance(deployment_version, str)
+                assert type(expected_safety_epoch) is int
+                assert isinstance(requested_at, str)
+                assert isinstance(expires_at, str)
+                assert isinstance(action, str)
+                assert isinstance(environment, str)
+                assert account_id is None or isinstance(account_id, str)
+                assert client_order_id is None or isinstance(client_order_id, str)
+                assert risk_decision_id is None or isinstance(risk_decision_id, str)
+                assert execution_plan_id is None or isinstance(execution_plan_id, str)
                 parsed = OperatorCommand(
-                    command_id=canonical["command_id"],
-                    actor=canonical["actor"],
-                    reason=canonical["reason"],
-                    deployment_version=canonical["deployment_version"],
-                    expected_safety_epoch=canonical["expected_safety_epoch"],
-                    requested_at=datetime.fromisoformat(canonical["requested_at"]),
-                    expires_at=datetime.fromisoformat(canonical["expires_at"]),
-                    action=OperatorAction(canonical["action"]),
-                    account_id=canonical["account_id"] or "LEGACY_GLOBAL",
-                    environment=TradingEnvironment(
-                        canonical.get("environment", TradingEnvironment.SIMULATED)
-                    ),
+                    command_id=command_id_value,
+                    actor=actor,
+                    reason=reason,
+                    deployment_version=deployment_version,
+                    expected_safety_epoch=expected_safety_epoch,
+                    requested_at=datetime.fromisoformat(requested_at),
+                    expires_at=datetime.fromisoformat(expires_at),
+                    action=OperatorAction(action),
+                    account_id=account_id or "LEGACY_GLOBAL",
+                    environment=TradingEnvironment(environment),
                     client_order_id=(
                         "LEGACY_UNBOUND"
                         if legacy_command
-                        and canonical["action"] == "RESOLVE_SUBMITTED_UNKNOWN"
-                        else canonical.get("client_order_id")
+                        and action == "RESOLVE_SUBMITTED_UNKNOWN"
+                        else client_order_id
                     ),
-                    risk_decision_id=canonical.get("risk_decision_id"),
-                    execution_plan_id=canonical.get("execution_plan_id"),
+                    risk_decision_id=risk_decision_id,
+                    execution_plan_id=execution_plan_id,
                 )
                 if (
                     cancel_keys.issubset(canonical)
@@ -1324,14 +1366,17 @@ class SQLiteLedger:
                     permit = canonical.get("permit")
                     risk = canonical.get("risk")
                     plan = canonical.get("plan")
-                    market = plan.get("market_evidence") if isinstance(plan, dict) else None
+                    if not all(isinstance(value, dict) for value in (permit, risk, plan)):
+                        raise SchemaError("order environment payload is malformed")
+                    assert isinstance(permit, dict)
+                    assert isinstance(risk, dict)
+                    assert isinstance(plan, dict)
+                    market = plan.get("market_evidence")
                     if (
                         environment not in {item.value for item in TradingEnvironment}
-                        or not isinstance(permit, dict)
                         or permit.get("environment") != environment
                         or not isinstance(permit.get("permit_id"), str)
                         or not permit["permit_id"].strip()
-                        or not isinstance(risk, dict)
                         or risk.get("input_snapshot_environment") != environment
                         or not isinstance(market, dict)
                         or market.get("environment") != environment
@@ -1405,6 +1450,17 @@ class SQLiteLedger:
                                 ):
                                     payload_invalid = True
                             action = commands[aggregate_id][0].action
+                            cancel_order = commands[aggregate_id][1].get("cancel_order")
+                            cancel_target = (
+                                cancel_order.get("target")
+                                if isinstance(cancel_order, dict)
+                                else None
+                            )
+                            cancel_broker_order_id = (
+                                cancel_target.get("broker_order_id")
+                                if isinstance(cancel_target, dict)
+                                else None
+                            )
                             other_permit_action = action in {
                                 OperatorAction.ISSUE_REDUCE_ONLY,
                                 OperatorAction.ISSUE_EMERGENCY_FLATTEN,
@@ -1421,10 +1477,7 @@ class SQLiteLedger:
                                     or not SQLiteLedger._cancel_binding_is_valid(
                                         commands[aggregate_id][1]
                                     )
-                                    or order_id
-                                    != commands[aggregate_id][1]["cancel_order"]["target"][
-                                        "broker_order_id"
-                                    ]
+                                    or order_id != cancel_broker_order_id
                                 )
                             ) or (
                                 other_permit_action
@@ -1493,8 +1546,18 @@ class SQLiteLedger:
                     }:
                         raise SchemaError("legacy unknown resolution payload is malformed")
                     for key in ("operator_command_id", "observation", "reference"):
-                        require_id(payload[key], key)
-                    evidence_time = datetime.fromisoformat(payload["observed_at"])
+                        value = payload[key]
+                        if not isinstance(value, str):
+                            raise SchemaError(
+                                "legacy unknown resolution payload is malformed"
+                            )
+                        require_id(value, key)
+                    resolution_observed_at = payload["observed_at"]
+                    if not isinstance(resolution_observed_at, str):
+                        raise SchemaError(
+                            "legacy unknown resolution payload is malformed"
+                        )
+                    evidence_time = datetime.fromisoformat(resolution_observed_at)
                     require_utc(evidence_time, "legacy unknown resolution observed_at")
                     if evidence_time > resolution_time:
                         raise SchemaError("unknown resolution evidence is from the future")
@@ -1503,12 +1566,18 @@ class SQLiteLedger:
                     if evidence.evidence.fetched_at > resolution_time:
                         raise SchemaError("unknown resolution evidence is from the future")
                 command_id = payload["operator_command_id"]
+                if not isinstance(command_id, str):
+                    raise SchemaError("unknown resolution command ID is malformed")
                 command_entry = commands.get(command_id)
                 order = order_rows.get(aggregate_id)
-                try:
-                    order_account = order["request"]["account_id"]
-                except (KeyError, TypeError):
-                    raise SchemaError("resolved order has no internal account alias") from None
+                if not isinstance(order, dict):
+                    raise SchemaError("resolved order has no internal account alias")
+                request = order.get("request")
+                if not isinstance(request, dict):
+                    raise SchemaError("resolved order has no internal account alias")
+                order_account = request.get("account_id")
+                if not isinstance(order_account, str):
+                    raise SchemaError("resolved order has no internal account alias")
                 order_environment = order.get("environment")
                 if (
                     command_entry is None
@@ -1571,8 +1640,11 @@ class SQLiteLedger:
                         continue
                     payload = SQLiteLedger._strict_json(payload_json)
                     fact = broker_fact_from_payload(payload)
+                    kind = payload.get("kind")
                     if (
-                        BROKER_FACT_EVENTS[payload["kind"]] != event_type
+                        not isinstance(kind, str)
+                        or kind not in BROKER_FACT_EVENTS
+                        or BROKER_FACT_EVENTS[kind] != event_type
                         or fact.fact_id != event_id
                         or fact.client_order_id != aggregate_id
                         or fact.occurred_at != datetime.fromisoformat(occurred_at)
@@ -1634,8 +1706,11 @@ class SQLiteLedger:
                             raise SchemaError("broker OPEN must follow exactly one ACK")
                         if not isinstance(order, dict) or not isinstance(ack[0][1], dict):
                             raise SchemaError("acknowledged broker order is malformed")
+                        broker_order_id = ack[0][1].get("broker_order_id")
+                        if not isinstance(broker_order_id, str):
+                            raise SchemaError("acknowledged broker order is malformed")
                         SQLiteLedger._validate_open_against_submission(
-                            opened, order, ack[0][1].get("broker_order_id")
+                            opened, order, broker_order_id
                         )
                         expected_plan = SQLiteLedger._lifecycle_release_plan(
                             (cash, exposure, sell, side), facts
@@ -1657,19 +1732,38 @@ class SQLiteLedger:
                             raise SchemaError(
                                 "broker lifecycle release order or amount is malformed"
                             )
+                        release_cash = [
+                            item[2].get("reserved_cash_minor") for item in releases
+                        ]
+                        release_exposure = [
+                            item[2].get("reserved_exposure_minor") for item in releases
+                        ]
+                        release_sell = [
+                            item[2].get("reserved_sell_quantity") for item in releases
+                        ]
+                        if not all(
+                            type(value) is int
+                            for values in (release_cash, release_exposure, release_sell)
+                            for value in values
+                        ):
+                            raise SchemaError("broker lifecycle release amount is malformed")
                         if projection.order.execution_state not in {
                             BrokerExecutionState.OPEN,
                             BrokerExecutionState.PARTIALLY_FILLED,
-                        } and sum(item[2]["reserved_cash_minor"] for item in releases) != cash:
+                        } and sum(value for value in release_cash if isinstance(value, int)) != cash:
                             raise SchemaError("terminal broker lifecycle did not fully release")
                         if projection.order.execution_state not in {
                             BrokerExecutionState.OPEN,
                             BrokerExecutionState.PARTIALLY_FILLED,
                         } and (
-                            sum(item[2]["reserved_exposure_minor"] for item in releases)
+                            sum(
+                                value for value in release_exposure
+                                if isinstance(value, int)
+                            )
                             != exposure
                             or sum(
-                                item[2]["reserved_sell_quantity"] for item in releases
+                                value for value in release_sell
+                                if isinstance(value, int)
                             ) != sell
                         ):
                             raise SchemaError("terminal broker lifecycle did not fully release")
@@ -1709,6 +1803,7 @@ class SQLiteLedger:
                 )
                 self.connection.execute("COMMIT")
                 return
+            statements: tuple[str, ...]
             if version == 9:
                 self._validate_schema(self.connection, 9)
                 self._validate_audit_semantics(self.connection, version=9)
@@ -1974,7 +2069,10 @@ class SQLiteLedger:
         if type(fact) not in BROKER_LIFECYCLE_FACT_TYPES:
             raise TypeError("exact typed broker lifecycle fact required")
         payload = canonical_broker_fact_payload(fact)
-        event_type = BROKER_FACT_EVENTS[payload["kind"]]
+        kind = payload.get("kind")
+        if not isinstance(kind, str) or kind not in BROKER_FACT_EVENTS:
+            raise ValueError("broker lifecycle fact kind is invalid")
+        event_type = BROKER_FACT_EVENTS[kind]
         recorded_at = datetime.now(timezone.utc).isoformat()
         try:
             self.connection.execute("BEGIN IMMEDIATE")
@@ -2025,6 +2123,8 @@ class SQLiteLedger:
             if not isinstance(order_payload, dict) or not isinstance(ack_payload, dict):
                 raise ValueError("acknowledged order payload is malformed")
             broker_order_id = ack_payload.get("broker_order_id")
+            if not isinstance(broker_order_id, str):
+                raise ValueError("acknowledged broker_order_id is malformed")
             require_id(broker_order_id, "acknowledged broker_order_id")
             prior_facts = self._facts_for(self.connection, fact.client_order_id)
             if type(fact) is BrokerOrderOpened:
@@ -2195,6 +2295,8 @@ class SQLiteLedger:
         try:
             request = canonical_payload["request"]
             risk = canonical_payload["risk"]
+            if not isinstance(request, dict) or not isinstance(risk, dict):
+                raise ValueError("immutable order payload sections must be objects")
             if (
                 request["account_id"] != reservation_terms.account_id
                 or request["instrument"] != {
