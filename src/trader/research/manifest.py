@@ -24,6 +24,7 @@ class RunSpec:
     """Immutable backtest inputs persisted before execution starts."""
 
     code_commit: str
+    source_sha256: str
     strategy_version: str
     config_sha256: str
     account_seed_sha256: str
@@ -56,7 +57,7 @@ class RunSpec:
             require_id(getattr(self, name), name)
         if type(self.code_commit) is not str or _GIT_REVISION.fullmatch(self.code_commit) is None:
             raise ValueError("code_commit must be a lowercase hexadecimal git revision")
-        for name in ("config_sha256", "account_seed_sha256"):
+        for name in ("source_sha256", "config_sha256", "account_seed_sha256"):
             value = getattr(self, name)
             if type(value) is not str or _SHA256.fullmatch(value) is None:
                 raise ValueError(f"{name} must be a lowercase SHA256 digest")

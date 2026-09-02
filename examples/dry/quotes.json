@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "calendar_version": "explicit-us-sessions-synthetic-v1",
+  "provenance": {
+    "source": "synthetic-project-example",
+    "license": "project-fixture-only"
+  },
+  "sessions": [
+    {
+      "session_id": "synthetic-2026-08-25",
+      "business_date": "2026-08-25",
+      "open_at": "2026-08-25T13:30:00Z",
+      "close_at": "2026-08-25T20:00:00Z"
+    },
+    {
+      "session_id": "synthetic-2026-08-26",
+      "business_date": "2026-08-26",
+      "open_at": "2026-08-26T13:30:00Z",
+      "close_at": "2026-08-26T20:00:00Z"
+    }
+  ],
+  "events": [
+    {
+      "event_id": "synthetic-quote-1",
+      "session_id": "synthetic-2026-08-25",
+      "occurred_at": "2026-08-25T13:31:00Z",
+      "available_at": "2026-08-25T13:31:01Z",
+      "source_sequence": 1,
+      "ingest_sequence": 1,
+      "bid": "99.00",
+      "ask": "101.00",
+      "available_quantity": 10,
+      "halted": false
+    },
+    {
+      "event_id": "synthetic-quote-2",
+      "session_id": "synthetic-2026-08-25",
+      "occurred_at": "2026-08-25T19:59:00Z",
+      "available_at": "2026-08-25T19:59:01Z",
+      "source_sequence": 2,
+      "ingest_sequence": 2,
+      "bid": "101.00",
+      "ask": "103.00",
+      "available_quantity": 10,
+      "halted": false
+    },
+    {
+      "event_id": "synthetic-quote-3",
+      "session_id": "synthetic-2026-08-26",
+      "occurred_at": "2026-08-26T13:31:00Z",
+      "available_at": "2026-08-26T13:31:01Z",
+      "source_sequence": 3,
+      "ingest_sequence": 3,
+      "bid": "100.00",
+      "ask": "101.00",
+      "available_quantity": 10,
+      "halted": false
+    },
+    {
+      "event_id": "synthetic-quote-4",
+      "session_id": "synthetic-2026-08-26",
+      "occurred_at": "2026-08-26T13:32:00Z",
+      "available_at": "2026-08-26T13:32:01Z",
+      "source_sequence": 4,
+      "ingest_sequence": 4,
+      "bid": "99.50",
+      "ask": "100.00",
+      "available_quantity": 10,
+      "halted": false
+    },
+    {
+      "event_id": "synthetic-quote-5",
+      "session_id": "synthetic-2026-08-26",
+      "occurred_at": "2026-08-26T13:33:00Z",
+      "available_at": "2026-08-26T13:33:01Z",
+      "source_sequence": 5,
+      "ingest_sequence": 5,
+      "bid": "100.00",
+      "ask": "100.50",
+      "available_quantity": 10,
+      "halted": false
+    }
+  ]
+}

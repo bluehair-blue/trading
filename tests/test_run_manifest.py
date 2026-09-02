@@ -11,6 +11,7 @@ NOW = datetime(2026, 8, 27, tzinfo=timezone.utc)
 def spec(**changes: object) -> RunSpec:
     values: dict[str, object] = {
         "code_commit": "e2bb483",
+        "source_sha256": "f" * 64,
         "strategy_version": "strategy-v1",
         "config_sha256": "a" * 64,
         "account_seed_sha256": "d" * 64,
@@ -48,6 +49,7 @@ class RunSpecTests(unittest.TestCase):
         self.assertNotEqual(
             spec().fingerprint(), spec(account_seed_sha256="e" * 64).fingerprint()
         )
+        self.assertNotEqual(spec().fingerprint(), spec(source_sha256="0" * 64).fingerprint())
 
     def test_result_links_success_or_failure_to_the_exact_spec(self) -> None:
         fingerprint = spec().fingerprint()
@@ -69,6 +71,7 @@ class RunSpecTests(unittest.TestCase):
     def test_invalid_spec_and_result_contracts_are_rejected(self) -> None:
         for changes in (
             {"config_sha256": "A" * 64},
+            {"source_sha256": "A" * 64},
             {"code_commit": "not-a-revision"},
             {"random_seed": True},
             {"sample_completed_at": NOW - timedelta(seconds=1)},

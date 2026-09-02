@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "mode": "DRY",
+  "data_sha256": "96bc9a48af90678d321b924f73b9593fad67807588d8c566c548bb67798d30ef",
+  "instrument": {
+    "market": "NASDAQ",
+    "symbol": "SYNTH",
+    "currency": "USD"
+  },
+  "account": {
+    "account_id": "dry-example-account",
+    "cash": "1000.00",
+    "positions": []
+  },
+  "strategy": {
+    "version": "previous-close-threshold-v1",
+    "threshold": "100.00",
+    "target_quantity": "2"
+  },
+  "risk": {
+    "policy_version": "dry-risk-v1",
+    "max_order_quantity": "2",
+    "cash_cap_minor": 100000,
+    "exposure_cap_minor": 100000,
+    "fee_buffer_minor": 100
+  },
+  "simulation": {
+    "partial_fill_cap": 1,
+    "slippage_bps": "0",
+    "fee_bps": "10",
+    "max_quote_age_seconds": 5
+  },
+  "random_seed": 0
+}

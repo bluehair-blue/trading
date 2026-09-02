@@ -5,11 +5,12 @@
 이 문서는 변경 비용이 큰 경계를 먼저 고정하고, 각 단계에서 필요한 코드만 추가하는 구현 기준선이다. 빈 골격과 선제적 인프라는 만들지 않는다.
 
 구현 상태는 **Phase 1B-B1 공통 주문 안전 경계, Phase 1B-B2 read-only 계약, Phase 1C
-시뮬레이터 기반**까지다. 계좌별 프로세스 잠금, 저장소가 강제하는 제출 상태기계, 모든
-환경의 단일 주문 경로와 permit 소비, risk reservation, 구조화 계좌 관측·대사, 단일
-WebSocket supervisor, 계층형 rate limit, no-retry mutation 분류기, typed UNKNOWN 증거,
-allocator, 브로커 주문·체결 사실 재생, Dry 회계 fold와 재현 가능한 `RunSpec`/`RunResult`를
-구현했다. 적용 약관과 운영 통제는
+시뮬레이터와 offline Dry backtest entrypoint**까지다. 계좌별 프로세스 잠금, 저장소가
+강제하는 제출 상태기계, 모든 환경의 단일 주문 경로와 permit 소비, risk reservation, 구조화
+계좌 관측·대사, 단일 WebSocket supervisor, 계층형 rate limit, no-retry mutation 분류기,
+typed UNKNOWN 증거, allocator, 브로커 주문·체결 사실 재생, Dry 회계 fold와 재현 가능한
+`RunSpec`/`RunResult`를 구현했다. Dry 실행·검증 명령과 경계는
+[`docs/DRY_BACKTEST_READY.md`](docs/DRY_BACKTEST_READY.md)에 기록한다. 적용 약관과 운영 통제는
 [키움 Open API 약관 검토](docs/TERMS_REVIEW.md)에 기록한다.
 
 중요한 경계가 있다. 현재 키움 코드는 주입된 transport와 합성 응답으로 검증한 독립
@@ -508,21 +509,19 @@ uv run python scripts/verify.py
 compileall, 전체 unittest, coverage floor 70%, Ruff, 전체 `src` mypy, repository secret scan,
 `uv pip check --python <현재 인터프리터>`를 fail-fast로 실행한다. GitHub Actions는
 Ubuntu와 Windows에서 locked development environment를 다시 만들고 같은 명령을 실행한다.
-2026-08-27 현재 전체 273개 테스트와 branch coverage 84%가 통과했다.
-고정된 mypy 2.3.1도 broad ignore나 exclude 없이 전체 42개 source file에서 통과한다.
 
 이번 체크포인트는 공통 모드 safety/permit, 저장소가 강제하는 제출 상태, risk reservation,
 구조화 read-only 관측과 대사, 단일 WebSocket supervisor, 계층형 limiter, no-retry mutation
 분류, typed `SUBMITTED_UNKNOWN` 증거, WAL-safe local backup/restore, simulator, allocator,
-typed broker lifecycle, Dry 회계 fold와 `RunSpec`/`RunResult`를 구현했다. 실제 Dry 실행 전에
-고정할 입력은 [`docs/DRY_BACKTEST_READY.md`](docs/DRY_BACKTEST_READY.md)에 기록한다. 세부
-결정과 다음 blocking gate는
+typed broker lifecycle, Dry 회계 fold와 `RunSpec`/`RunResult`, strict offline Dry backtest
+validator/runner를 구현했다. 합성 fixture의 실행·검증 명령과 정확한 범위는
+[`docs/DRY_BACKTEST_READY.md`](docs/DRY_BACKTEST_READY.md)에 기록한다. 세부 결정과 다음 blocking gate는
 [`docs/PHASE1B_DECISIONS.md`](docs/PHASE1B_DECISIONS.md)에 기록한다.
 
-전략·불변 시장 데이터·TradingCalendar source·회계 시작 상태와 정책, 실제 backtest
-entrypoint, 영구 cash·position accounting projection, 인증된 운영자 CLI,
+실제 투자 전략·불변 시장 데이터·TradingCalendar source·회계 시작 상태와 정책의 선정과
+성능 검증, 영구적인 broker-integrated cash·position projection, 인증된 운영자 CLI,
 보존·암호화·off-host backup, 실제 broker 연결과 주문·정정·취소·축소·청산은 명시적으로
-보류한다. 합성 응답으로 만든 UNKNOWN 증거와 CI 결과를 broker 독립 검증으로 간주하지 않는다.
+보류한다. `examples/dry/` 데이터는 합성 fixture이며 성능 주장을 뒷받침하지 않는다.
 
 ## 13. 단계별 구현 게이트
 
@@ -530,7 +529,7 @@ entrypoint, 영구 cash·position accounting projection, 인증된 운영자 CLI
 |---|---|---|
 | 0. 명세 | 이 아키텍처, 전략·주문 의미, 위험·운영 정책 | 아래 Phase 1 blocking 결정이 모두 닫히고 가정과 사실이 구분됨 |
 | 1. 코어 | 도메인 계약, StubBroker, 원장, 세 위험 단계, calendar/permit/operator control | 상태·불변식·안전 단위 테스트 통과 |
-| 2. 백테스트 | 비용·슬리피지, 편향 방지, `RunSpec`/`RunResult` | 홀드아웃·워크포워드 재현 가능 |
+| 2. 백테스트 | offline Dry entrypoint, strict input validation, 비용·슬리피지, `RunSpec`/`RunResult` | 동일 입력의 `output_sha256` 재현; 홀드아웃·워크포워드와 성능 검증은 별도 |
 | 3. 읽기 전용 | 키움 인증, 시세, 계좌, WebSocket | 장시간 실행·재연결·대사 통과 |
 | 4. 모의 주문 | 주문·정정·취소·부분체결 | 중복·타임아웃·재시작 테스트 통과 |
 | 5. 섀도 | 실제 시세 + 가상 체결 | 예상/실제 가능 체결 괴리 측정 |
