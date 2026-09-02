@@ -1,6 +1,6 @@
 # 개인용 알고리즘 트레이딩 시스템
 
-> Architecture baseline v0.3 — 2026-08-27
+> Architecture baseline v0.4 — 2026-09-02
 
 이 문서는 변경 비용이 큰 경계를 먼저 고정하고, 각 단계에서 필요한 코드만 추가하는 구현 기준선이다. 빈 골격과 선제적 인프라는 만들지 않는다.
 
@@ -8,8 +8,9 @@
 시뮬레이터와 offline Dry backtest entrypoint**까지다. 계좌별 프로세스 잠금, 저장소가
 강제하는 제출 상태기계, 모든 환경의 단일 주문 경로와 permit 소비, risk reservation, 구조화
 계좌 관측·대사, 단일 WebSocket supervisor, 계층형 rate limit, no-retry mutation 분류기,
-typed UNKNOWN 증거, allocator, 브로커 주문·체결 사실 재생, Dry 회계 fold와 재현 가능한
-`RunSpec`/`RunResult`를 구현했다. Dry 실행·검증 명령과 경계는
+typed UNKNOWN 증거, allocator, 브로커 주문·체결 사실 재생, Dry 회계 fold, 세션 close/sample-end
+성과 valuation과 재현 가능한 `RunSpec`/`RunResult`를 구현했다. 성과 출력은 합성 검증용
+`REFERENCE_ONLY`이며 수익성 또는 Paper/Live 승인을 뜻하지 않는다. Dry 실행·검증 명령과 경계는
 [`docs/DRY_BACKTEST_READY.md`](docs/DRY_BACKTEST_READY.md)에 기록한다. 적용 약관과 운영 통제는
 [키움 Open API 약관 검토](docs/TERMS_REVIEW.md)에 기록한다.
 
@@ -407,8 +408,9 @@ WebSocket disconnect, timeout·401·malformed response와 crash/restart 대사�
 7. 정규화한 typed broker fact를 기록한다. 수량을 해소하는 fact는 해당 risk reservation
    해제를 같은 트랜잭션에 기록하고, 재시작 때 주문 수량 partition과 해제 금액을 전부
    replay해 검증한다.
-8. Dry 모드는 불변 `AccountingSeed`와 체결 사실로 cash·position을 순수 재생한다. 실제
-   계좌의 영구 cash·position projection은 회계 정책과 broker 대사 계약을 확정한 뒤 추가한다.
+8. Dry 모드는 불변 `AccountingSeed`와 체결 사실로 cash·position을 순수 재생하고, 같은
+   사실과 checkpoint 당시 가용한 bid로 Phase A 성과를 순수 계산한다. 실제 계좌의 영구
+   cash·position/performance projection은 회계 정책과 broker 대사 계약을 확정한 뒤 추가한다.
 ```
 
 - 원장은 append-only 감사 기록이며 원장 저장 API에는 `UPDATE/DELETE`가 없다. DB가 권한을 지원하면 애플리케이션 계정에서도 이를 제거하고, SQLite에서는 보호 trigger와 회귀 테스트로 강제한다. 오류 수정은 원본을 참조하는 정정 이벤트만 추가한다.
@@ -513,13 +515,14 @@ Ubuntu와 Windows에서 locked development environment를 다시 만들고 같�
 이번 체크포인트는 공통 모드 safety/permit, 저장소가 강제하는 제출 상태, risk reservation,
 구조화 read-only 관측과 대사, 단일 WebSocket supervisor, 계층형 limiter, no-retry mutation
 분류, typed `SUBMITTED_UNKNOWN` 증거, WAL-safe local backup/restore, simulator, allocator,
-typed broker lifecycle, Dry 회계 fold와 `RunSpec`/`RunResult`, strict offline Dry backtest
-validator/runner를 구현했다. 합성 fixture의 실행·검증 명령과 정확한 범위는
+typed broker lifecycle, Dry 회계 fold, `REFERENCE_ONLY` Phase A 성과 valuation,
+`RunSpec`/`RunResult`, strict offline Dry backtest validator/runner를 구현했다. 합성 fixture의
+실행·검증 명령과 정확한 범위는
 [`docs/DRY_BACKTEST_READY.md`](docs/DRY_BACKTEST_READY.md)에 기록한다. 세부 결정과 다음 blocking gate는
 [`docs/PHASE1B_DECISIONS.md`](docs/PHASE1B_DECISIONS.md)에 기록한다.
 
-실제 투자 전략·불변 시장 데이터·TradingCalendar source·회계 시작 상태와 정책의 선정과
-성능 검증, 영구적인 broker-integrated cash·position projection, 인증된 운영자 CLI,
+실제 투자 전략·불변 시장 데이터·공식 TradingCalendar source·회계 정책의 선정과 통계적
+성능 검증, 영구적인 broker-integrated cash·position/performance projection, 인증된 운영자 CLI,
 보존·암호화·off-host backup, 실제 broker 연결과 주문·정정·취소·축소·청산은 명시적으로
 보류한다. `examples/dry/` 데이터는 합성 fixture이며 성능 주장을 뒷받침하지 않는다.
 

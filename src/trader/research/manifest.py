@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
 import json
@@ -36,6 +36,8 @@ class RunSpec:
     slippage_model_version: str
     fx_model_version: str
     accounting_model_version: str
+    valuation_policy_version: str
+    valuation_max_mark_age_seconds: int
     random_seed: int
     decision_cutoff_policy: str
     sample_started_at: datetime
@@ -52,6 +54,7 @@ class RunSpec:
             "slippage_model_version",
             "fx_model_version",
             "accounting_model_version",
+            "valuation_policy_version",
             "decision_cutoff_policy",
         ):
             require_id(getattr(self, name), name)
@@ -63,6 +66,17 @@ class RunSpec:
                 raise ValueError(f"{name} must be a lowercase SHA256 digest")
         if type(self.random_seed) is not int or not -(2**63) <= self.random_seed < 2**63:
             raise ValueError("random_seed must be a signed 64-bit integer")
+        if (
+            type(self.valuation_max_mark_age_seconds) is not int
+            or self.valuation_max_mark_age_seconds < 0
+        ):
+            raise ValueError("valuation_max_mark_age_seconds must be non-negative")
+        try:
+            timedelta(seconds=self.valuation_max_mark_age_seconds)
+        except OverflowError as error:
+            raise ValueError(
+                "valuation_max_mark_age_seconds exceeds the supported duration"
+            ) from error
         require_utc(self.sample_started_at, "sample_started_at")
         require_utc(self.sample_completed_at, "sample_completed_at")
         if self.sample_completed_at < self.sample_started_at:

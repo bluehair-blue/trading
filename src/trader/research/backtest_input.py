@@ -27,6 +27,7 @@ __all__ = [
     "BacktestInputError",
     "HistoricalQuote",
     "TradingSession",
+    "VALUATION_POLICY_VERSION",
     "ValidatedBacktest",
     "validate_backtest_inputs",
 ]
@@ -35,6 +36,7 @@ __all__ = [
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _MAX_CONFIG_BYTES = 1_000_000
 _MAX_DATA_BYTES = 100_000_000
+VALUATION_POLICY_VERSION = "session-close-last-non-halted-bid-v1"
 
 
 class BacktestInputError(ValueError):
@@ -120,6 +122,8 @@ class BacktestConfiguration:
     slippage_bps: Decimal
     fee_bps: Decimal
     max_quote_age_seconds: int
+    valuation_policy_version: str
+    valuation_max_mark_age_seconds: int
     random_seed: int
 
     def __post_init__(self) -> None:
@@ -168,6 +172,19 @@ class BacktestConfiguration:
         except OverflowError as error:
             raise BacktestInputError(
                 "max_quote_age_seconds exceeds the supported duration"
+            ) from error
+        if self.valuation_policy_version != VALUATION_POLICY_VERSION:
+            raise BacktestInputError("valuation policy_version is unsupported")
+        if (
+            type(self.valuation_max_mark_age_seconds) is not int
+            or self.valuation_max_mark_age_seconds < 0
+        ):
+            raise BacktestInputError("valuation max_mark_age_seconds must be non-negative")
+        try:
+            timedelta(seconds=self.valuation_max_mark_age_seconds)
+        except OverflowError as error:
+            raise BacktestInputError(
+                "valuation max_mark_age_seconds exceeds the supported duration"
             ) from error
         if type(self.random_seed) is not int or not -(2**63) <= self.random_seed < 2**63:
             raise BacktestInputError("random_seed must be a signed 64-bit integer")
@@ -349,12 +366,13 @@ def _parse_config(payload: dict[str, object]) -> BacktestConfiguration:
             "strategy",
             "risk",
             "simulation",
+            "valuation",
             "random_seed",
         },
         "config",
     )
-    if payload["schema_version"] != 1 or payload["mode"] != "DRY":
-        raise BacktestInputError("config requires schema_version 1 and mode DRY")
+    if payload["schema_version"] != 2 or payload["mode"] != "DRY":
+        raise BacktestInputError("config requires schema_version 2 and mode DRY")
     instrument = _instrument(payload["instrument"], "instrument")
 
     account = _object(payload["account"], "account")
@@ -378,6 +396,8 @@ def _parse_config(payload: dict[str, object]) -> BacktestConfiguration:
                 ),
             )
         )
+    if positions:
+        raise BacktestInputError("Phase A requires zero starting positions")
     seed = AccountingSeed(
         _string(account["account_id"], "account.account_id"),
         TradingEnvironment.SIMULATED,
@@ -425,6 +445,12 @@ def _parse_config(payload: dict[str, object]) -> BacktestConfiguration:
     partial = simulation["partial_fill_cap"]
     if partial is not None:
         partial = _integer(partial, "simulation.partial_fill_cap", minimum=1)
+    valuation = _object(payload["valuation"], "valuation")
+    _exact_keys(
+        valuation,
+        {"policy_version", "max_mark_age_seconds"},
+        "valuation",
+    )
     return BacktestConfiguration(
         _string(payload["data_sha256"], "data_sha256"),
         instrument,
@@ -453,6 +479,11 @@ def _parse_config(payload: dict[str, object]) -> BacktestConfiguration:
         _integer(
             simulation["max_quote_age_seconds"],
             "simulation.max_quote_age_seconds",
+        ),
+        _string(valuation["policy_version"], "valuation.policy_version"),
+        _integer(
+            valuation["max_mark_age_seconds"],
+            "valuation.max_mark_age_seconds",
         ),
         _signed_integer(payload["random_seed"], "random_seed"),
     )
@@ -570,9 +601,6 @@ def _parse_data(payload: dict[str, object], raw: bytes) -> BacktestData:
     session_ids_with_events = {item.session_id for item in events}
     if session_ids_with_events != set(by_session):
         raise BacktestInputError("every declared session requires at least one event")
-    for session in sessions:
-        if not any(item.session_id == session.session_id and not item.halted for item in events):
-            raise BacktestInputError("every session requires at least one non-halted event")
     return BacktestData(
         _string(payload["calendar_version"], "calendar_version"),
         tuple(sessions),
@@ -622,22 +650,28 @@ def validate_backtest_inputs(
         separators=(",", ":"),
     )
     run_spec = RunSpec(
-        code_commit,
-        _source_sha256(),
-        config.strategy.version,
-        sha256(config_raw).hexdigest(),
-        config.accounting_seed.fingerprint(),
-        f"sha256-{data.sha256}",
-        f"sha256-{sha256(instrument_payload.encode('utf-8')).hexdigest()}",
-        data.calendar_version,
-        "fail-closed-no-corporate-actions-v1",
-        "simulated-fee-bps-v1",
-        "simulated-slippage-bps-v1",
-        "usd-only-v1",
-        config.accounting_seed.policy_version,
-        config.random_seed,
-        "previous-close-current-session-first-quote-next-event-fill-v1",
-        data.events[0].available_at,
-        data.events[-1].available_at,
+        code_commit=code_commit,
+        source_sha256=_source_sha256(),
+        strategy_version=config.strategy.version,
+        config_sha256=sha256(config_raw).hexdigest(),
+        account_seed_sha256=config.accounting_seed.fingerprint(),
+        data_snapshot_id=f"sha256-{data.sha256}",
+        universe_snapshot_id=(
+            f"sha256-{sha256(instrument_payload.encode('utf-8')).hexdigest()}"
+        ),
+        calendar_version=data.calendar_version,
+        corporate_action_version="fail-closed-no-corporate-actions-v1",
+        fee_model_version="simulated-fee-bps-v1",
+        slippage_model_version="simulated-slippage-bps-v1",
+        fx_model_version="usd-only-v1",
+        accounting_model_version=config.accounting_seed.policy_version,
+        valuation_policy_version=config.valuation_policy_version,
+        valuation_max_mark_age_seconds=config.valuation_max_mark_age_seconds,
+        random_seed=config.random_seed,
+        decision_cutoff_policy=(
+            "previous-close-current-session-first-quote-next-event-fill-v1"
+        ),
+        sample_started_at=data.events[0].available_at,
+        sample_completed_at=data.events[-1].available_at,
     )
     return ValidatedBacktest(run_spec, config, data)

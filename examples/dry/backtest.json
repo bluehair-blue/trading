@@ -1,7 +1,7 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "mode": "DRY",
-  "data_sha256": "96bc9a48af90678d321b924f73b9593fad67807588d8c566c548bb67798d30ef",
+  "data_sha256": "19db9e43c80556d47bb47a4d503a33604aabbe746787e14e2576f7d735373ce4",
   "instrument": {
     "market": "NASDAQ",
     "symbol": "SYNTH",
@@ -29,6 +29,10 @@
     "slippage_bps": "0",
     "fee_bps": "10",
     "max_quote_age_seconds": 5
+  },
+  "valuation": {
+    "policy_version": "session-close-last-non-halted-bid-v1",
+    "max_mark_age_seconds": 300
   },
   "random_seed": 0
 }

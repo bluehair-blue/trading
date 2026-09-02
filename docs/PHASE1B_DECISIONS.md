@@ -95,14 +95,18 @@ request builder in composition, and no credential-backed paper/live call has bee
   revalidates exact fact, execution-ID, quantity-partition, release-order, and
   terminal-full-release semantics on reopen.
 - `AccountingSeed` and broker fills form a deterministic, long-only, same-currency Dry cash and
-  position fold. It is not the durable authoritative accounting projection for paper/live.
+  position fold. Phase A additionally projects weighted-average basis, fee-aware realized and
+  unrealized PnL, session-close/sample-end equity, return, drawdown, and turnover from those same
+  immutable facts. It is not the durable authoritative accounting projection for paper/live.
 - `RunSpec` serializes immutable code, strategy, config, data, universe, calendar,
-  corporate-action, fee, slippage, FX, accounting, seed, cutoff-policy, and sample-window inputs to
-  canonical JSON with a SHA-256 fingerprint. `RunResult` separately binds execution identity,
-  status, timing, ledger digest, output digest, or a canonical failure code to that fingerprint.
-- `VirtualClock` advances only under the Dry runner. The actual runner remains intentionally absent
-  until the strategy, immutable data, calendar, and accounting inputs in
-  [`DRY_BACKTEST_READY.md`](DRY_BACKTEST_READY.md) are selected.
+  corporate-action, fee, slippage, FX, accounting, valuation policy/mark age, seed, cutoff-policy,
+  and sample-window inputs to canonical JSON with a SHA-256 fingerprint. `RunResult` separately
+  binds execution identity, execution status, timing, ledger digest, output digest, or a canonical
+  failure code to that fingerprint.
+- `VirtualClock` advances only under the implemented credential-free Dry runner. Phase A values
+  each declared session close and sample end from the last same-session non-halted bid available by
+  that checkpoint. Missing/stale marks make evaluation `INCOMPLETE` without changing a successful
+  execution status; output remains `REFERENCE_ONLY` and creates no Paper/Live authority.
 
 ## Ledger verification and backup
 

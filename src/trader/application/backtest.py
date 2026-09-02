@@ -22,6 +22,7 @@ from trader.domain.models import (
     require_id,
     require_utc,
 )
+from trader.domain.performance import PerformanceProjection
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -183,6 +184,7 @@ class BacktestOutput:
     orders: tuple[BacktestOrderRecord, ...]
     fills: tuple[BacktestFillRecord, ...]
     accounting: AccountingProjection
+    performance: PerformanceProjection
 
     def __post_init__(self) -> None:
         _require_sha256(self.run_spec_fingerprint, "run_spec_fingerprint")
@@ -219,6 +221,7 @@ class BacktestOutput:
         self._validate_unique_ids()
         self._validate_fill_bindings()
         self._validate_accounting()
+        self._validate_performance()
 
     def _validate_unique_ids(self) -> None:
         decision_ids = tuple(item.decision.decision_id for item in self.decisions)
@@ -287,6 +290,16 @@ class BacktestOutput:
         ):
             raise ValueError("backtest accounting supports USD instruments only")
 
+    def _validate_performance(self) -> None:
+        if type(self.performance) is not PerformanceProjection:
+            raise ValueError("performance must be exact PerformanceProjection")
+        if (
+            self.performance.gross_traded_value != self.accounting.gross_traded_value
+            or self.performance.total_fees != self.accounting.total_fees
+            or self.performance.fills != len(self.fills)
+        ):
+            raise ValueError("performance totals must match fills and accounting")
+
     def canonical_json(self) -> str:
         order_ordinals = {
             order.client_order_id: ordinal
@@ -302,6 +315,7 @@ class BacktestOutput:
                 for item in self.fills
             ],
             "accounting": _canonical_accounting(self.accounting),
+            "performance": self.performance.canonical_payload(),
         }
         return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 

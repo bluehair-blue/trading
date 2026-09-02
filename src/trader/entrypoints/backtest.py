@@ -65,6 +65,13 @@ from trader.domain.models import (
     TradeIntent,
     TradingEnvironment,
 )
+from trader.domain.performance import (
+    IncompleteReasonCode,
+    MarkUnavailable,
+    PerformanceMark,
+    ValuationCheckpoint,
+    project_performance,
+)
 from trader.domain.risk import pre_trade_quantity_cap
 from trader.research.backtest_input import (
     BacktestConfiguration as BacktestConfiguration,
@@ -333,6 +340,83 @@ def _projection_from_ledger(
     return facts, fold_accounting(seed, facts)
 
 
+def _valuation_checkpoint(
+    *,
+    data: BacktestData,
+    config: BacktestConfiguration,
+    session_id: str,
+    checkpoint_at: datetime,
+    is_session_close: bool,
+    is_sample_end: bool,
+) -> ValuationCheckpoint:
+    candidates = tuple(
+        event
+        for event in data.events
+        if event.session_id == session_id
+        and not event.halted
+        and event.occurred_at <= checkpoint_at
+        and event.available_at <= checkpoint_at
+    )
+    if not candidates:
+        return ValuationCheckpoint(
+            checkpoint_at,
+            unavailable_marks=(
+                MarkUnavailable(config.instrument, IncompleteReasonCode.MISSING_MARK),
+            ),
+            is_session_close=is_session_close,
+            is_sample_end=is_sample_end,
+        )
+    latest = max(candidates, key=lambda event: (event.occurred_at, event.source_sequence))
+    if checkpoint_at - latest.occurred_at > timedelta(
+        seconds=config.valuation_max_mark_age_seconds
+    ):
+        return ValuationCheckpoint(
+            checkpoint_at,
+            unavailable_marks=(
+                MarkUnavailable(config.instrument, IncompleteReasonCode.STALE_MARK),
+            ),
+            is_session_close=is_session_close,
+            is_sample_end=is_sample_end,
+        )
+    return ValuationCheckpoint(
+        checkpoint_at,
+        marks=(PerformanceMark(config.instrument, latest.bid),),
+        is_session_close=is_session_close,
+        is_sample_end=is_sample_end,
+    )
+
+
+def _valuation_checkpoints(
+    data: BacktestData,
+    config: BacktestConfiguration,
+    sample_completed_at: datetime,
+) -> tuple[ValuationCheckpoint, ...]:
+    checkpoints = [
+        _valuation_checkpoint(
+            data=data,
+            config=config,
+            session_id=session.session_id,
+            checkpoint_at=session.close_at,
+            is_session_close=True,
+            is_sample_end=session.close_at == sample_completed_at,
+        )
+        for session in data.sessions
+    ]
+    if all(checkpoint.checkpoint_at != sample_completed_at for checkpoint in checkpoints):
+        sample_session_id = data.events[-1].session_id
+        checkpoints.append(
+            _valuation_checkpoint(
+                data=data,
+                config=config,
+                session_id=sample_session_id,
+                checkpoint_at=sample_completed_at,
+                is_session_close=False,
+                is_sample_end=True,
+            )
+        )
+    return tuple(sorted(checkpoints, key=lambda checkpoint: checkpoint.checkpoint_at))
+
+
 def run_dry_backtest(
     config_path: str | Path,
     data_path: str | Path,
@@ -421,6 +505,9 @@ def _run_validated_backtest(
     current_session_mid: Decimal | None = None
     current_session_event_id: str | None = None
     decision_made_for_session = False
+    valuation_checkpoints = _valuation_checkpoints(
+        data, config, run_spec.sample_completed_at
+    )
 
     try:
         for event in data.events:
@@ -588,6 +675,11 @@ def _run_validated_backtest(
             _record_facts(lifecycle, cancellation.facts)
 
         facts, accounting = _projection_from_ledger(ledger, config.accounting_seed)
+        performance = project_performance(
+            config.accounting_seed,
+            facts,
+            valuation_checkpoints,
+        )
         opened_sides = {
             fact.client_order_id: fact.side
             for fact in facts
@@ -637,6 +729,7 @@ def _run_validated_backtest(
             tuple(orders),
             tuple(fills),
             accounting,
+            performance,
         )
         if not ledger.full_ledger_verify():
             raise BacktestExecutionError("ledger verification failed before close")
@@ -653,6 +746,13 @@ def _run_validated_backtest(
         )
         if reopened_facts != facts or reopened_accounting != accounting:
             raise BacktestExecutionError("ledger reopen changed lifecycle or accounting replay")
+        reopened_performance = project_performance(
+            config.accounting_seed,
+            reopened_facts,
+            valuation_checkpoints,
+        )
+        if reopened_performance != performance:
+            raise BacktestExecutionError("ledger reopen changed performance replay")
     finally:
         reopened.close()
 

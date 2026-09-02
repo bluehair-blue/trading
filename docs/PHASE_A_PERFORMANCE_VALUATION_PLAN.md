@@ -1,6 +1,6 @@
 # Phase A performance and valuation plan
 
-> Status: PROPOSED. Do not implement until the decision set below is approved.
+> Status: IMPLEMENTED 2026-09-02. The decision set below was adopted without deviation.
 
 ## Outcome
 

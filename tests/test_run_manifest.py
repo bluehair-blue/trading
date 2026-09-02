@@ -23,6 +23,8 @@ def spec(**changes: object) -> RunSpec:
         "slippage_model_version": "slippage-v1",
         "fx_model_version": "fx-v1",
         "accounting_model_version": "accounting-v1",
+        "valuation_policy_version": "session-close-last-non-halted-bid-v1",
+        "valuation_max_mark_age_seconds": 3600,
         "random_seed": 7,
         "decision_cutoff_policy": "previous-close-v1",
         "sample_started_at": NOW,
@@ -50,6 +52,14 @@ class RunSpecTests(unittest.TestCase):
             spec().fingerprint(), spec(account_seed_sha256="e" * 64).fingerprint()
         )
         self.assertNotEqual(spec().fingerprint(), spec(source_sha256="0" * 64).fingerprint())
+        self.assertNotEqual(
+            spec().fingerprint(),
+            spec(valuation_max_mark_age_seconds=3601).fingerprint(),
+        )
+        self.assertNotEqual(
+            spec().fingerprint(),
+            spec(valuation_policy_version="other-policy-v1").fingerprint(),
+        )
 
     def test_result_links_success_or_failure_to_the_exact_spec(self) -> None:
         fingerprint = spec().fingerprint()
@@ -74,6 +84,9 @@ class RunSpecTests(unittest.TestCase):
             {"source_sha256": "A" * 64},
             {"code_commit": "not-a-revision"},
             {"random_seed": True},
+            {"valuation_policy_version": ""},
+            {"valuation_max_mark_age_seconds": -1},
+            {"valuation_max_mark_age_seconds": 10**30},
             {"sample_completed_at": NOW - timedelta(seconds=1)},
         ):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
